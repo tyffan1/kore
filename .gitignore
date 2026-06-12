@@ -1,0 +1,51 @@
+# Rust
+/target/
+
+# CMake / Ninja
+/build/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+build.ninja
+.ninja_deps
+.ninja_log
+
+# Python tooling
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Native build outputs
+*.a
+*.d
+*.dll
+*.dylib
+*.exe
+*.ilk
+*.lib
+*.lo
+*.log
+*.o
+*.obj
+*.out
+*.pdb
+*.so
+
+# Test / coverage artifacts
+coverage/
+*.profraw
+*.profdata
+*.lcov
+
+# Editor / OS files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db

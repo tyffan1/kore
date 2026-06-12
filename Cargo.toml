@@ -1,0 +1,32 @@
+[workspace]
+members = [
+    "components/css",
+    "components/html",
+    "components/net",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+repository = "https://example.invalid/kore"
+rust-version = "1.78"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+
+[workspace.dependencies]
+bytes = "1.6"
+http-body-util = "0.1"
+hyper = { version = "1.6", features = ["client", "http1", "http2"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "ring", "tls12", "webpki-roots"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2", "tokio"] }
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "1.0"
+tokio = { version = "1.38", features = ["macros", "rt-multi-thread", "time"] }
+url = { version = "2.5", features = ["serde"] }

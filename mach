@@ -1,0 +1,84 @@
+#!/usr/bin/env python3
+"""Kore browser build entry point."""
+
+from __future__ import annotations
+
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parent
+
+
+def run(cmd: list[str], *, cwd: Path = ROOT) -> int:
+    print("+", " ".join(cmd), flush=True)
+    return subprocess.call(cmd, cwd=cwd)
+
+
+def require(tool: str) -> None:
+    if shutil.which(tool) is None:
+        raise SystemExit(f"required tool not found on PATH: {tool}")
+
+
+def cmd_build(_: argparse.Namespace) -> int:
+    require("cargo")
+    return run(["cargo", "build", "--workspace"])
+
+
+def cmd_test(_: argparse.Namespace) -> int:
+    require("cargo")
+    return run(["cargo", "test", "--workspace"])
+
+
+def cmd_run(_: argparse.Namespace) -> int:
+    print("kore v0.1.0 scaffold: browser shell is not implemented yet.")
+    print("Foundational components can be exercised with './mach test'.")
+    return 0
+
+
+def cmd_configure(args: argparse.Namespace) -> int:
+    require("cmake")
+    build_dir = ROOT / "build" / args.profile
+    build_dir.mkdir(parents=True, exist_ok=True)
+    generator = os.environ.get("CMAKE_GENERATOR", "Ninja")
+    return run(
+        [
+            "cmake",
+            "-S",
+            str(ROOT),
+            "-B",
+            str(build_dir),
+            "-G",
+            generator,
+            f"-DCMAKE_BUILD_TYPE={args.profile.capitalize()}",
+        ]
+    )
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="./mach")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    build = sub.add_parser("build", help="build the workspace")
+    build.set_defaults(func=cmd_build)
+
+    test = sub.add_parser("test", help="run all unit tests")
+    test.set_defaults(func=cmd_test)
+
+    run_parser = sub.add_parser("run", help="run the browser shell")
+    run_parser.set_defaults(func=cmd_run)
+
+    configure = sub.add_parser("configure", help="configure CMake build files")
+    configure.add_argument("--profile", choices=["debug", "release"], default="debug")
+    configure.set_defaults(func=cmd_configure)
+
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
