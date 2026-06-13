@@ -41,6 +41,9 @@ mod display_list_tests {
             text: "hello".into(),
             font_size: 12.0,
             color: Color::WHITE,
+            font_family: None,
+            bold: false,
+            italic: false,
         });
         list.push_image(DrawImage {
             x: 20.0,

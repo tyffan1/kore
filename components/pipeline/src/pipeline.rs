@@ -1,7 +1,7 @@
 use kore_css::{parse_stylesheet, CssColor};
-use kore_gpu::{Color, DisplayList, DrawRect};
+use kore_gpu::{Color, DisplayList, DrawRect, DrawText};
 use kore_html::{parse_document, NodeKind};
-use kore_layout::{layout_document, LayoutConfig, LayoutTree};
+use kore_layout::{layout_document, FontStyle, FontWeight, LayoutConfig, LayoutTree};
 use kore_net::{FetchRequest, HttpClient};
 use url::Url;
 
@@ -16,6 +16,15 @@ figure, figcaption, blockquote, dl, dt, dd, form, table {
 head, script, style, link, meta, title {
     display: none;
 }
+body {
+    font-size: 16px;
+    color: black;
+}
+h1 { font-size: 32px; font-weight: bold; }
+h2 { font-size: 24px; font-weight: bold; }
+h3 { font-size: 18px; font-weight: bold; }
+b, strong { font-weight: bold; }
+i, em { font-style: italic; }
 "#;
 
 /// Result of a full render pipeline run.
@@ -156,11 +165,6 @@ fn default_bg_color(tag_name: &str) -> Option<Color> {
 }
 
 /// Build a DisplayList from a LayoutTree and its associated DOM.
-///
-/// Each layout node with a non-zero rect gets rendered using:
-/// - Its `background_color` if set,
-/// - A default element background if one exists for its tag,
-/// - Otherwise it is skipped (no background).
 pub fn build_display_list(document: &kore_html::Document, layout_tree: &LayoutTree) -> DisplayList {
     let mut dl = DisplayList::new();
 
@@ -189,6 +193,37 @@ pub fn build_display_list(document: &kore_html::Document, layout_tree: &LayoutTr
                 height: node.rect.height,
                 color,
             });
+        }
+
+        // Emit text commands for text nodes
+        if let Some(dom_id) = node.dom_node_id {
+            if let Some(dom_node) = document.node(dom_id) {
+                if let NodeKind::Text(text) = &dom_node.kind {
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        let content_rect = node.content_rect();
+                        let text_color = node
+                            .style
+                            .color
+                            .map(to_gpu_color)
+                            .unwrap_or(Color::BLACK);
+                        let font_size = node.style.font_size.unwrap_or(16.0);
+                        let bold = node.style.font_weight == FontWeight::Bold;
+                        let italic = node.style.font_style == FontStyle::Italic;
+
+                        dl.push_text(DrawText {
+                            x: content_rect.x,
+                            y: content_rect.y,
+                            text: trimmed.to_string(),
+                            font_size,
+                            color: text_color,
+                            font_family: Some("sans-serif".to_string()),
+                            bold,
+                            italic,
+                        });
+                    }
+                }
+            }
         }
     }
 
@@ -229,6 +264,16 @@ mod tests {
             }
         }
         None
+    }
+
+    fn find_text(dl: &DisplayList) -> Vec<&DrawText> {
+        let mut texts = Vec::new();
+        for cmd in dl.commands() {
+            if let kore_gpu::DisplayCommand::Text(t) = cmd {
+                texts.push(t);
+            }
+        }
+        texts
     }
 
     #[test]
@@ -303,7 +348,7 @@ mod tests {
     fn test_skip_zero_size_nodes() {
         let (_, _, dl) = run_render(
             r#"<div id="empty"></div>"#,
-            "#empty { background-color: red; }", // no width/height → zero-size
+            "#empty { background-color: red; }",
         );
         let red_rect = find_rect(&dl, 255, 0, 0);
         assert!(red_rect.is_none(), "zero-size node should be skipped");
@@ -348,5 +393,65 @@ mod tests {
             }
         }
         panic!("no rect found");
+    }
+
+    #[test]
+    fn test_paragraph_text_emits_drawtext() {
+        let (_, _, dl) = run_render(
+            r#"<p id="p1">Hello World</p>"#,
+            "#p1 { color: red; }",
+        );
+        let texts = find_text(&dl);
+        assert!(!texts.is_empty(), "should have at least one text command");
+        let has_hello = texts.iter().any(|t| t.text.contains("Hello World"));
+        assert!(has_hello, "should contain 'Hello World' text");
+        let has_red = texts.iter().any(|t| (t.color.r - 1.0).abs() < 0.01);
+        assert!(has_red, "should have red colored text");
+    }
+
+    #[test]
+    fn test_heading_has_bold_and_larger_font() {
+        let (_, _, dl) = run_render(
+            r#"<h1 id="h">Heading</h1>"#,
+            "",
+        );
+        let texts = find_text(&dl);
+        let heading = texts.iter().find(|t| t.text.contains("Heading"));
+        assert!(heading.is_some(), "should have heading text");
+        let h = heading.unwrap();
+        assert!(h.bold, "h1 should be bold");
+        assert!(h.font_size >= 24.0, "h1 should have large font size");
+    }
+
+    #[test]
+    fn test_text_color_from_css() {
+        let (_, _, dl) = run_render(
+            r#"<p id="tc">colored text</p>"#,
+            "#tc { color: #0000ff; }",
+        );
+        let texts = find_text(&dl);
+        let colored = texts.iter().find(|t| t.text.contains("colored"));
+        assert!(colored.is_some(), "should have colored text");
+        let c = colored.unwrap();
+        assert!((c.color.b - 1.0).abs() < 0.01, "text should be blue");
+    }
+
+    #[test]
+    fn test_bold_and_italic_from_css() {
+        let (_, _, dl) = run_render(
+            r#"<p><b id="b">Bold</b><i id="i">Italic</i></p>"#,
+            "",
+        );
+        let texts = find_text(&dl);
+        let bold = texts.iter().find(|t| t.text.contains("Bold"));
+        let italic = texts.iter().find(|t| t.text.contains("Italic"));
+        assert!(bold.is_some(), "should have Bold text");
+        assert!(italic.is_some(), "should have Italic text");
+        if let Some(b) = bold {
+            assert!(b.bold, "Bold tag should produce bold text");
+        }
+        if let Some(i) = italic {
+            assert!(i.italic, "Italic tag should produce italic text");
+        }
     }
 }

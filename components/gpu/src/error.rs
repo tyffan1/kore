@@ -22,4 +22,8 @@ pub enum GpuError {
     /// A frame operation was called in the wrong order.
     #[error("frame state error: {0}")]
     FrameState(&'static str),
+
+    /// Font loading or glyph rasterization failed.
+    #[error("font error: {0}")]
+    Font(String),
 }

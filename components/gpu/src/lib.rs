@@ -16,4 +16,6 @@ mod tests;
 pub use atlas::TextureAtlas;
 pub use display_list::{ClipRect, Color, DisplayCommand, DisplayList, DrawImage, DrawRect, DrawText};
 pub use error::GpuError;
+pub use pipeline::{RectPipeline, TextPipeline};
 pub use renderer::{FrameRenderer, Renderer, RendererConfig};
+pub use vertex::{rect_vertices, text_quad_vertices, TextVertex, Vertex, RECT_INDICES};

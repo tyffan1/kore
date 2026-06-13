@@ -1,6 +1,6 @@
 use crate::{
-    AlignItems, ComputedStyle, Display, FlexDirection, FlexWrap, JustifyContent, LayoutNode,
-    LayoutNodeId, LayoutTree, Rect,
+    AlignItems, ComputedStyle, Display, FlexDirection, FlexWrap, FontStyle, FontWeight,
+    JustifyContent, LayoutNode, LayoutNodeId, LayoutTree, Rect,
 };
 use kore_css::{cascade_for_element, ElementSnapshot, StyleSheet};
 use kore_html::{Document, Element, NodeId, NodeKind};
@@ -99,22 +99,25 @@ impl<'a> LayoutBuilder<'a> {
             .ok_or(LayoutError::MissingDomNode)?;
         match &dom_node.kind {
             NodeKind::Element(element) => {
-                let style = self.computed_style(element);
+                let mut style = self.computed_style(element);
                 if style.display == Display::None {
                     return Ok(());
                 }
+                // Inherit from parent layout node
+                inherit_from_parent(&mut style, &self.nodes, parent);
                 let layout_id = self.push_node(Some(dom_id), Some(parent), style);
                 for child_id in &dom_node.children {
                     self.build_dom_subtree(*child_id, layout_id)?;
                 }
             }
             NodeKind::Text(text) if !text.trim().is_empty() => {
-                let style = ComputedStyle {
+                let mut style = ComputedStyle {
                     display: Display::Inline,
                     width: Some(text_width(text)),
                     height: Some(LINE_HEIGHT),
                     ..ComputedStyle::default()
                 };
+                inherit_from_parent(&mut style, &self.nodes, parent);
                 self.push_node(Some(dom_id), Some(parent), style);
             }
             NodeKind::Document
@@ -173,8 +176,19 @@ fn layout_node(
         Display::Inline | Display::InlineBlock => {
             let width = preferred_width(&nodes[id.0], containing_width);
             let height = preferred_height(&nodes[id.0], LINE_HEIGHT);
-            nodes[id.0].rect = Rect::new(x, y, width, height);
-            Ok(height)
+            // Lay out children as inline content
+            let children = nodes[id.0].children.clone();
+            let mut cursor_x = x;
+            let mut max_h = height;
+            for child in children {
+                let child_w = preferred_width(&nodes[child.0], width);
+                let child_h = preferred_height(&nodes[child.0], LINE_HEIGHT);
+                let _ = layout_node(nodes, child, cursor_x, y, child_w, child_h);
+                cursor_x += child_w;
+                max_h = max_h.max(child_h);
+            }
+            nodes[id.0].rect = Rect::new(x, y, (cursor_x - x).max(width), max_h);
+            Ok(max_h)
         }
         Display::Block => layout_block(nodes, id, x, y, containing_width, containing_height),
         Display::None => Ok(0.0),
@@ -465,6 +479,25 @@ fn default_display(tag_name: &str) -> Display {
 
 fn text_width(text: &str) -> f32 {
     text.chars().count() as f32 * TEXT_ADVANCE
+}
+
+/// Inherit CSS properties that cascade by default from the parent layout node.
+fn inherit_from_parent(style: &mut ComputedStyle, nodes: &[LayoutNode], parent: LayoutNodeId) {
+    let Some(p) = nodes.get(parent.0).map(|n| &n.style) else {
+        return;
+    };
+    if style.color.is_none() {
+        style.color = p.color;
+    }
+    if style.font_size.is_none() {
+        style.font_size = p.font_size;
+    }
+    if style.font_weight == FontWeight::Normal && p.font_weight == FontWeight::Bold {
+        style.font_weight = p.font_weight;
+    }
+    if style.font_style == FontStyle::Normal && p.font_style == FontStyle::Italic {
+        style.font_style = p.font_style;
+    }
 }
 
 #[cfg(test)]

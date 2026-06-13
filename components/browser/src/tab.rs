@@ -8,17 +8,64 @@ pub struct Tab {
     pub title: String,
     pub is_active: bool,
     pub process_id: Option<u32>,
+    #[serde(default)]
+    pub history: Vec<Url>,
+    #[serde(default)]
+    pub history_index: usize,
 }
 
 impl Tab {
     pub fn new(id: u64, url: Url) -> Self {
         let title = url.as_str().to_string();
+        let mut history = Vec::new();
+        history.push(url.clone());
         Self {
             id,
             url,
             title,
             is_active: false,
             process_id: None,
+            history,
+            history_index: 0,
+        }
+    }
+
+    pub fn navigate(&mut self, url: Url) {
+        if self.history.is_empty() {
+            self.history.push(self.url.clone());
+            self.history_index = 0;
+        }
+        self.history.truncate(self.history_index + 1);
+        self.history.push(url.clone());
+        self.history_index = self.history.len() - 1;
+        self.url = url;
+    }
+
+    pub fn can_go_back(&self) -> bool {
+        self.history_index > 0
+    }
+
+    pub fn can_go_forward(&self) -> bool {
+        self.history_index + 1 < self.history.len()
+    }
+
+    pub fn go_back(&mut self) -> Option<Url> {
+        if self.can_go_back() {
+            self.history_index -= 1;
+            self.url = self.history[self.history_index].clone();
+            Some(self.url.clone())
+        } else {
+            None
+        }
+    }
+
+    pub fn go_forward(&mut self) -> Option<Url> {
+        if self.can_go_forward() {
+            self.history_index += 1;
+            self.url = self.history[self.history_index].clone();
+            Some(self.url.clone())
+        } else {
+            None
         }
     }
 }
@@ -206,5 +253,66 @@ mod tests {
     fn active_tab_returns_none_when_empty() {
         let mgr = TabManager::new();
         assert!(mgr.active_tab().is_none());
+    }
+
+    #[test]
+    fn tab_navigate_updates_history() {
+        let mut tab = Tab::new(0, test_url("https://a.com/"));
+        tab.navigate(test_url("https://b.com/"));
+        tab.navigate(test_url("https://c.com/"));
+        assert_eq!(tab.history.len(), 3);
+        assert_eq!(tab.history_index, 2);
+        assert_eq!(tab.url.as_str(), "https://c.com/");
+    }
+
+    #[test]
+    fn tab_go_back_forward() {
+        let mut tab = Tab::new(0, test_url("https://a.com/"));
+        tab.navigate(test_url("https://b.com/"));
+        tab.navigate(test_url("https://c.com/"));
+
+        assert!(tab.can_go_back());
+        assert!(!tab.can_go_forward());
+
+        let back_url = tab.go_back().expect("go back");
+        assert_eq!(back_url.as_str(), "https://b.com/");
+        assert_eq!(tab.history_index, 1);
+        assert!(tab.can_go_back());
+        assert!(tab.can_go_forward());
+
+        let forward_url = tab.go_forward().expect("go forward");
+        assert_eq!(forward_url.as_str(), "https://c.com/");
+        assert_eq!(tab.history_index, 2);
+        assert!(tab.can_go_back());
+        assert!(!tab.can_go_forward());
+    }
+
+    #[test]
+    fn tab_go_back_at_start_returns_none() {
+        let mut tab = Tab::new(0, test_url("https://a.com/"));
+        assert!(!tab.can_go_back());
+        assert!(tab.go_back().is_none());
+    }
+
+    #[test]
+    fn tab_go_forward_at_end_returns_none() {
+        let mut tab = Tab::new(0, test_url("https://a.com/"));
+        assert!(!tab.can_go_forward());
+        assert!(tab.go_forward().is_none());
+    }
+
+    #[test]
+    fn tab_navigate_after_go_back_truncates_forward_history() {
+        let mut tab = Tab::new(0, test_url("https://a.com/"));
+        tab.navigate(test_url("https://b.com/"));
+        tab.navigate(test_url("https://c.com/"));
+        tab.go_back().expect("back");
+        tab.go_back().expect("back");
+
+        tab.navigate(test_url("https://d.com/"));
+        assert_eq!(tab.history.len(), 2);
+        assert_eq!(tab.history_index, 1);
+        assert_eq!(tab.history[0].as_str(), "https://a.com/");
+        assert_eq!(tab.history[1].as_str(), "https://d.com/");
     }
 }

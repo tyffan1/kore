@@ -40,6 +40,18 @@ pub enum FlexWrap {
     Wrap,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FontWeight {
+    Normal,
+    Bold,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FontStyle {
+    Normal,
+    Italic,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ComputedStyle {
     pub display: Display,
@@ -51,6 +63,8 @@ pub struct ComputedStyle {
     pub background_color: Option<CssColor>,
     pub color: Option<CssColor>,
     pub font_size: Option<f32>,
+    pub font_weight: FontWeight,
+    pub font_style: FontStyle,
     pub flex_direction: FlexDirection,
     pub justify_content: JustifyContent,
     pub align_items: AlignItems,
@@ -69,6 +83,8 @@ impl Default for ComputedStyle {
             background_color: None,
             color: None,
             font_size: None,
+            font_weight: FontWeight::Normal,
+            font_style: FontStyle::Normal,
             flex_direction: FlexDirection::Row,
             justify_content: JustifyContent::FlexStart,
             align_items: AlignItems::Stretch,
@@ -99,6 +115,19 @@ impl ComputedStyle {
         style.background_color = map.get("background-color").and_then(|v| CssColor::parse(v));
         style.color = map.get("color").and_then(|v| CssColor::parse(v));
         style.font_size = map.get("font-size").and_then(|v| parse_length(v));
+
+        if let Some(value) = map.get("font-weight") {
+            style.font_weight = match *value {
+                "bold" | "700" | "800" | "900" => FontWeight::Bold,
+                _ => FontWeight::Normal,
+            };
+        }
+        if let Some(value) = map.get("font-style") {
+            style.font_style = match *value {
+                "italic" | "oblique" => FontStyle::Italic,
+                _ => FontStyle::Normal,
+            };
+        }
 
         if let Some(value) = map.get("flex-direction") {
             style.flex_direction = match *value {

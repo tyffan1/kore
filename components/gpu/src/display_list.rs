@@ -43,6 +43,9 @@ pub struct DrawText {
     pub text: String,
     pub font_size: f32,
     pub color: Color,
+    pub font_family: Option<String>,
+    pub bold: bool,
+    pub italic: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

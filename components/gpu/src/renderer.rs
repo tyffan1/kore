@@ -1,11 +1,15 @@
+use std::cell::RefCell;
+
 use wgpu::util::DeviceExt;
 
 use crate::{
     display_list::{DisplayCommand, DisplayList},
     error::GpuError,
-    pipeline::RectPipeline,
-    vertex::{rect_vertices, Vertex, RECT_INDICES},
+    pipeline::{RectPipeline, TextPipeline},
+    vertex::{rect_vertices, TextVertex, Vertex, RECT_INDICES},
 };
+
+use kore_font::{FontCache, FontDescription, FontId};
 
 #[derive(Debug, Clone)]
 pub struct RendererConfig {
@@ -29,9 +33,15 @@ pub struct Renderer {
     pub queue: wgpu::Queue,
     pub surface: wgpu::Surface<'static>,
     pub surface_config: wgpu::SurfaceConfiguration,
-    pipeline: RectPipeline,
+    rect_pipeline: RectPipeline,
+    text_pipeline: TextPipeline,
     viewport_buffer: wgpu::Buffer,
     viewport_bind_group: wgpu::BindGroup,
+    text_bind_group: wgpu::BindGroup,
+    _placeholder_texture: wgpu::Texture,
+    _placeholder_sampler: wgpu::Sampler,
+    font_cache: RefCell<FontCache>,
+    font_id: FontId,
 }
 
 impl Renderer {
@@ -81,7 +91,8 @@ impl Renderer {
         };
         surface.configure(&device, &surface_config);
 
-        let pipeline = RectPipeline::new(&device, surface_format);
+        let rect_pipeline = RectPipeline::new(&device, surface_format);
+        let text_pipeline = TextPipeline::new(&device, surface_format);
 
         let viewport_data: [f32; 4] = [config.width as f32, config.height as f32, 0.0, 0.0];
         let viewport_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -92,21 +103,98 @@ impl Renderer {
 
         let viewport_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
-            layout: &pipeline.viewport_bind_group_layout,
+            layout: &rect_pipeline.viewport_bind_group_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
                 resource: viewport_buffer.as_entire_binding(),
             }],
         });
 
+        // Create a 1x1 white placeholder texture for text pipeline
+        let placeholder_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+
+        let placeholder_view = placeholder_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let placeholder_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: None,
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+
+        queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &placeholder_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &[255u8],
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(1),
+                rows_per_image: Some(1),
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        let text_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &text_pipeline.texture_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&placeholder_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&placeholder_sampler),
+                },
+            ],
+        });
+
+        let font_data: &[u8] = include_bytes!("C:/Windows/Fonts/arial.ttf");
+        let mut font_cache = FontCache::new();
+        let font_desc = FontDescription::new("Arial", false, false);
+        let font_id = font_cache
+            .load_font_bytes(font_data, font_desc)
+            .map_err(|e| GpuError::Font(e.to_string()))?;
+
         Ok(Self {
             device,
             queue,
             surface,
             surface_config,
-            pipeline,
+            rect_pipeline,
+            text_pipeline,
             viewport_buffer,
             viewport_bind_group,
+            text_bind_group,
+            _placeholder_texture: placeholder_texture,
+            _placeholder_sampler: placeholder_sampler,
+            font_cache: RefCell::new(font_cache),
+            font_id,
         })
     }
 
@@ -130,11 +218,16 @@ impl Renderer {
         let surface_texture = self.surface.get_current_texture()?;
         Ok(FrameRenderer {
             surface_texture,
-            vertices: Vec::new(),
-            indices: Vec::new(),
+            rect_vertices: Vec::new(),
+            rect_indices: Vec::new(),
+            text_vertices: Vec::new(),
+            text_indices: Vec::new(),
         })
     }
 
+    /// Submit a display list.
+    /// Text commands are rendered as placeholder colored quads positioned
+    /// at the correct glyph locations.
     pub fn submit(&self, frame: &mut FrameRenderer, list: &DisplayList) {
         let mut clip_stack: Vec<crate::display_list::ClipRect> = Vec::new();
 
@@ -152,12 +245,58 @@ impl Renderer {
                             continue;
                         }
                     }
-                    let base = frame.vertices.len() as u16;
+                    let base = frame.rect_vertices.len() as u16;
                     let color = [r.color.r, r.color.g, r.color.b, r.color.a];
                     let verts = rect_vertices(r.x, r.y, r.width, r.height, color);
-                    frame.vertices.extend_from_slice(&verts);
+                    frame.rect_vertices.extend_from_slice(&verts);
                     for &i in &RECT_INDICES {
-                        frame.indices.push(base + i);
+                        frame.rect_indices.push(base + i);
+                    }
+                }
+                DisplayCommand::Text(t) => {
+                    if let Some(clip) = clip_stack.last() {
+                        let approx_w = t.font_size * t.text.len() as f32 * 0.6;
+                        let approx_h = t.font_size * 1.2;
+                        let rect_clip = crate::display_list::ClipRect {
+                            x: t.x,
+                            y: t.y,
+                            width: approx_w,
+                            height: approx_h,
+                        };
+                        if !clip.intersects(&rect_clip) {
+                            continue;
+                        }
+                    }
+                    let color = [t.color.r, t.color.g, t.color.b, t.color.a];
+                    let mut cursor_x = t.x;
+                    let baseline_y = t.y;
+                    let mut cache = self.font_cache.borrow_mut();
+
+                    for ch in t.text.chars() {
+                        let bitmap = cache
+                            .rasterize_glyph(self.font_id, ch, t.font_size)
+                            .cloned();
+                        if let Some(g) = bitmap {
+                            let glyph_top = baseline_y - g.y_offset as f32 - g.height as f32;
+                            for py in 0..g.height {
+                                let row_start = py * g.width;
+                                for px in 0..g.width {
+                                    if g.pixels[row_start as usize + px as usize] > 127 {
+                                        let rx = cursor_x + g.x_offset as f32 + px as f32;
+                                        let ry = glyph_top + py as f32;
+                                        let base = frame.rect_vertices.len() as u16;
+                                        let verts = rect_vertices(rx, ry, 1.0, 1.0, color);
+                                        frame.rect_vertices.extend_from_slice(&verts);
+                                        for &i in &RECT_INDICES {
+                                            frame.rect_indices.push(base + i);
+                                        }
+                                    }
+                                }
+                            }
+                            cursor_x += g.advance_width;
+                        } else {
+                            cursor_x += t.font_size * 0.6;
+                        }
                     }
                 }
                 DisplayCommand::PushClip(c) => {
@@ -166,32 +305,19 @@ impl Renderer {
                 DisplayCommand::PopClip => {
                     clip_stack.pop();
                 }
-                DisplayCommand::Text(_) | DisplayCommand::Image(_) => {}
+                DisplayCommand::Image(_) => {}
             }
         }
     }
 
     pub fn end_frame(&self, frame: FrameRenderer) -> Result<(), GpuError> {
-        if frame.vertices.is_empty() {
+        let rect_empty = frame.rect_vertices.is_empty();
+        let text_empty = frame.text_vertices.is_empty();
+
+        if rect_empty && text_empty {
             frame.surface_texture.present();
             return Ok(());
         }
-
-        let vertex_buffer =
-            self.device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: None,
-                    contents: bytemuck::cast_slice(&frame.vertices),
-                    usage: wgpu::BufferUsages::VERTEX,
-                });
-
-        let index_buffer =
-            self.device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: None,
-                    contents: bytemuck::cast_slice(&frame.indices),
-                    usage: wgpu::BufferUsages::INDEX,
-                });
 
         let view = frame
             .surface_texture
@@ -223,11 +349,56 @@ impl Renderer {
                 occlusion_query_set: None,
             });
 
-            pass.set_pipeline(&self.pipeline.pipeline);
-            pass.set_bind_group(0, &self.viewport_bind_group, &[]);
-            pass.set_vertex_buffer(0, vertex_buffer.slice(..));
-            pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint16);
-            pass.draw_indexed(0..frame.indices.len() as u32, 0, 0..1);
+            if !rect_empty {
+                let vertex_buffer =
+                    self.device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: None,
+                            contents: bytemuck::cast_slice(&frame.rect_vertices),
+                            usage: wgpu::BufferUsages::VERTEX,
+                        });
+
+                let index_buffer =
+                    self.device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: None,
+                            contents: bytemuck::cast_slice(&frame.rect_indices),
+                            usage: wgpu::BufferUsages::INDEX,
+                        });
+
+                pass.set_pipeline(&self.rect_pipeline.pipeline);
+                pass.set_bind_group(0, &self.viewport_bind_group, &[]);
+                pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+                pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+                pass.draw_indexed(0..frame.rect_indices.len() as u32, 0, 0..1);
+            }
+
+            if !text_empty {
+                let vertex_buffer =
+                    self.device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: None,
+                            contents: bytemuck::cast_slice(&frame.text_vertices),
+                            usage: wgpu::BufferUsages::VERTEX,
+                        });
+
+                let index_buffer =
+                    self.device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: None,
+                            contents: bytemuck::cast_slice(&frame.text_indices),
+                            usage: wgpu::BufferUsages::INDEX,
+                        });
+
+                pass.set_pipeline(&self.text_pipeline.pipeline);
+                // Bind group 0 = viewport uniform (shared with rect pipeline)
+                pass.set_bind_group(0, &self.viewport_bind_group, &[]);
+                // Bind group 1 = texture + sampler
+                pass.set_bind_group(1, &self.text_bind_group, &[]);
+                pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+                pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+                pass.draw_indexed(0..frame.text_indices.len() as u32, 0, 0..1);
+            }
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
@@ -239,6 +410,8 @@ impl Renderer {
 
 pub struct FrameRenderer {
     pub(crate) surface_texture: wgpu::SurfaceTexture,
-    pub(crate) vertices: Vec<Vertex>,
-    pub(crate) indices: Vec<u16>,
+    pub(crate) rect_vertices: Vec<Vertex>,
+    pub(crate) rect_indices: Vec<u16>,
+    pub(crate) text_vertices: Vec<TextVertex>,
+    pub(crate) text_indices: Vec<u16>,
 }
