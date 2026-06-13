@@ -1015,6 +1015,7 @@ dependencies = [
  "kore-html",
  "kore-layout",
  "kore-net",
+ "kore-pipeline",
  "kore-ui",
  "kore-window",
  "pollster",
@@ -1096,6 +1097,21 @@ dependencies = [
  "serde",
  "thiserror 1.0.69",
  "tokio",
+ "url",
+]
+
+[[package]]
+name = "kore-pipeline"
+version = "0.1.0"
+dependencies = [
+ "kore-css",
+ "kore-gpu",
+ "kore-html",
+ "kore-layout",
+ "kore-net",
+ "pollster",
+ "serde",
+ "thiserror 1.0.69",
  "url",
 ]
 

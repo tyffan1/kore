@@ -1,34 +1,21 @@
 use std::cell::RefCell;
+use std::sync::Arc;
 
 use kore_browser::BrowserApp;
-use kore_css::parse_stylesheet;
 use kore_gpu::{Color, DisplayCommand, DisplayList, DrawRect, Renderer, RendererConfig};
-use kore_html::parse_document;
-use kore_layout::{layout_document, LayoutConfig};
-use kore_net::{FetchRequest, HttpClient};
-use kore_ui::Theme;
+use kore_pipeline::Pipeline;
 use kore_window::{AppEvent, EventLoop, InputEvent, Key, WindowBuilder, WindowHandle};
-
-const DEFAULT_CSS: &str = r#"
-html, body, div, p, h1, h2, h3, h4, h5, h6, ul, ol, li,
-header, footer, main, nav, section, article, aside,
-figure, figcaption, blockquote, dl, dt, dd, form, table {
-    display: block;
-}
-head, script, style, link, meta, title {
-    display: none;
-}
-"#;
 
 struct AppState {
     browser: BrowserApp,
-    http_client: HttpClient,
-    theme: Theme,
+    pipeline: Pipeline,
     display_list: DisplayList,
     content_display_list: DisplayList,
     address_bar_focused: bool,
     url_buffer: String,
     ctrl_pressed: bool,
+    loading: bool,
+    page_title: Option<String>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -51,16 +38,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let state = RefCell::new(AppState {
         browser,
-        http_client: HttpClient::default(),
-        theme: Theme::System,
+        pipeline: Pipeline::default(),
         display_list: DisplayList::new(),
         content_display_list: DisplayList::new(),
         address_bar_focused: false,
         url_buffer: String::new(),
         ctrl_pressed: false,
+        loading: false,
+        page_title: None,
     });
 
-    let window = RefCell::new(None::<std::sync::Arc<winit::window::Window>>);
+    let window = RefCell::new(None::<Arc<winit::window::Window>>);
     let renderer = RefCell::new(None::<Renderer>);
 
     el.run(move |event, elwt| {
@@ -95,6 +83,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 {
                     let mut s = state.borrow_mut();
                     build_display_list(&mut s);
+                }
+
+                if let Some(ref w) = *window.borrow() {
+                    let s = state.borrow();
+                    let title = s
+                        .page_title
+                        .as_deref()
+                        .map(|t| format!("{t} - Kore"))
+                        .unwrap_or_else(|| "Kore".to_string());
+                    w.set_title(&title);
                 }
 
                 if let Some(r) = renderer.borrow_mut().as_mut() {
@@ -223,76 +221,24 @@ fn handle_input(state: &mut AppState, event: InputEvent) {
 fn navigate(state: &mut AppState, url: url::Url) {
     if url.as_str() == "about:blank" || url.as_str() == "about:newtab" {
         state.content_display_list.clear();
+        state.page_title = None;
         return;
     }
 
-    let request = match FetchRequest::get(url.as_str()) {
-        Ok(r) => r,
+    state.loading = true;
+
+    let render_output = match state.pipeline.render(&url) {
+        Ok(output) => output,
         Err(e) => {
-            eprintln!("FetchRequest error: {e}");
+            eprintln!("Render pipeline error: {e}");
+            state.loading = false;
             return;
         }
     };
 
-    let response = match pollster::block_on(state.http_client.fetch(request)) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("HTTP fetch error: {e}");
-            return;
-        }
-    };
-
-    let html_str = match String::from_utf8(response.body.to_vec()) {
-        Ok(s) => s,
-        Err(_) => {
-            eprintln!("Response body is not valid UTF-8");
-            return;
-        }
-    };
-
-    let document = match parse_document(&html_str) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("HTML parse error: {e:?}");
-            return;
-        }
-    };
-
-    let stylesheet = match parse_stylesheet(DEFAULT_CSS) {
-        Ok(s) => s,
-        Err(_) => {
-            eprintln!("Default CSS parse error");
-            return;
-        }
-    };
-
-    let (content_w, content_h) = (1264.0, 628.0);
-    let layout_config = LayoutConfig {
-        viewport_width: content_w,
-        viewport_height: content_h,
-    };
-
-    let layout_tree = match layout_document(&document, &stylesheet, layout_config) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("Layout error: {e:?}");
-            return;
-        }
-    };
-
-    let mut dl = DisplayList::new();
-    for node in &layout_tree.nodes {
-        if node.rect.width > 0.0 && node.rect.height > 0.0 {
-            dl.push_rect(DrawRect {
-                x: node.rect.x,
-                y: node.rect.y,
-                width: node.rect.width,
-                height: node.rect.height,
-                color: Color::from_rgba8(200, 200, 220, 255),
-            });
-        }
-    }
-    state.content_display_list = dl;
+    state.content_display_list = render_output.display_list;
+    state.page_title = render_output.title;
+    state.loading = false;
 }
 
 fn build_display_list(state: &mut AppState) {
@@ -356,11 +302,25 @@ fn build_display_list(state: &mut AppState) {
         color: url_bg,
     });
 
+    // Loading indicator: a thin colored bar at the bottom of the address bar
+    if state.loading {
+        list.push_rect(DrawRect {
+            x: 10.0,
+            y: 76.0,
+            width: width - 20.0,
+            height: 3.0,
+            color: Color::from_rgba8(66, 133, 244, 255),
+        });
+    }
+
+    let content_area_y = 84.0;
+    let content_area_h = height - 92.0;
+
     list.push_rect(DrawRect {
         x: 8.0,
-        y: 84.0,
+        y: content_area_y,
         width: width - 16.0,
-        height: height - 92.0,
+        height: content_area_h,
         color: Color::from_rgba8(255, 255, 255, 255),
     });
 
@@ -368,7 +328,7 @@ fn build_display_list(state: &mut AppState) {
         if let DisplayCommand::Rect(rect) = cmd {
             list.push_rect(DrawRect {
                 x: 8.0 + rect.x,
-                y: 84.0 + rect.y,
+                y: content_area_y + rect.y,
                 width: rect.width,
                 height: rect.height,
                 color: rect.color,

@@ -1,5 +1,5 @@
 use crate::BoxEdges;
-use kore_css::CascadedProperty;
+use kore_css::{CascadedProperty, CssColor};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -48,6 +48,9 @@ pub struct ComputedStyle {
     pub margin: BoxEdges,
     pub border: BoxEdges,
     pub padding: BoxEdges,
+    pub background_color: Option<CssColor>,
+    pub color: Option<CssColor>,
+    pub font_size: Option<f32>,
     pub flex_direction: FlexDirection,
     pub justify_content: JustifyContent,
     pub align_items: AlignItems,
@@ -63,6 +66,9 @@ impl Default for ComputedStyle {
             margin: BoxEdges::ZERO,
             border: BoxEdges::ZERO,
             padding: BoxEdges::ZERO,
+            background_color: None,
+            color: None,
+            font_size: None,
             flex_direction: FlexDirection::Row,
             justify_content: JustifyContent::FlexStart,
             align_items: AlignItems::Stretch,
@@ -90,6 +96,10 @@ impl ComputedStyle {
         style.margin = parse_edges(&map, "margin");
         style.border = parse_edges(&map, "border");
         style.padding = parse_edges(&map, "padding");
+        style.background_color = map.get("background-color").and_then(|v| CssColor::parse(v));
+        style.color = map.get("color").and_then(|v| CssColor::parse(v));
+        style.font_size = map.get("font-size").and_then(|v| parse_length(v));
+
         if let Some(value) = map.get("flex-direction") {
             style.flex_direction = match *value {
                 "column" | "column-reverse" => FlexDirection::Column,

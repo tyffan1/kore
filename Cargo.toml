@@ -21,6 +21,7 @@ members = [
     "components/ipc",
     "components/layout",
     "components/net",
+    "components/pipeline",
     "components/renderer",
     "components/sandbox",
     "components/ui",
@@ -49,6 +50,7 @@ kore-gpu = { path = "components/gpu" }
 kore-html = { path = "components/html" }
 kore-layout = { path = "components/layout" }
 kore-net = { path = "components/net" }
+kore-pipeline = { path = "components/pipeline" }
 kore-ui = { path = "components/ui" }
 kore-window = { path = "components/window" }
 pollster = "0.4"
