@@ -1,5 +1,6 @@
 # Rust
 /target/
+/.cargo/.package-cache/
 
 # CMake / Ninja
 /build/
@@ -19,6 +20,11 @@ __pycache__/
 .ruff_cache/
 .venv/
 venv/
+
+# Local environment
+.env
+.env.*
+!.env.example
 
 # Native build outputs
 *.a
@@ -41,6 +47,16 @@ coverage/
 *.profraw
 *.profdata
 *.lcov
+junit.xml
+test-results/
+
+# Fuzzing / profiling artifacts
+artifacts/
+corpus/
+crash-*
+heaptrack.*
+perf.data*
+flamegraph.svg
 
 # Editor / OS files
 .idea/
@@ -49,3 +65,6 @@ coverage/
 *.swo
 .DS_Store
 Thumbs.db
+Desktop.ini
+*.tmp
+*.temp
