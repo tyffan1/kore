@@ -78,21 +78,27 @@ impl EventLoop {
             }
             winit::event::WindowEvent::KeyboardInput { event: ke, .. } => {
                 let key = key_from_winit(&ke.physical_key);
-                let input = match ke.state {
-                    winit::event::ElementState::Pressed => {
-                        InputEvent::KeyPressed {
-                            key,
-                            modifiers: Modifiers::NONE,
+                let has_text = ke.text.as_ref().is_some_and(|t| !t.is_empty());
+                if has_text && ke.state == winit::event::ElementState::Pressed {
+                    let text = ke.text.as_ref().map(|s| s.to_string()).unwrap_or_default();
+                    Some(AppEvent::Input(InputEvent::TextInput(text)))
+                } else {
+                    let input = match ke.state {
+                        winit::event::ElementState::Pressed => {
+                            InputEvent::KeyPressed {
+                                key,
+                                modifiers: Modifiers::NONE,
+                            }
                         }
-                    }
-                    winit::event::ElementState::Released => {
-                        InputEvent::KeyReleased {
-                            key,
-                            modifiers: Modifiers::NONE,
+                        winit::event::ElementState::Released => {
+                            InputEvent::KeyReleased {
+                                key,
+                                modifiers: Modifiers::NONE,
+                            }
                         }
-                    }
-                };
-                Some(AppEvent::Input(input))
+                    };
+                    Some(AppEvent::Input(input))
+                }
             }
             winit::event::WindowEvent::CursorMoved { position, .. } => {
                 Some(AppEvent::Input(InputEvent::MouseMoved {

@@ -44,7 +44,11 @@ panic = "deny"
 
 [dependencies]
 kore-browser = { path = "components/browser" }
+kore-css = { path = "components/css" }
 kore-gpu = { path = "components/gpu" }
+kore-html = { path = "components/html" }
+kore-layout = { path = "components/layout" }
+kore-net = { path = "components/net" }
 kore-ui = { path = "components/ui" }
 kore-window = { path = "components/window" }
 pollster = "0.4"

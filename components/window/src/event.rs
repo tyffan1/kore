@@ -48,6 +48,7 @@ pub enum InputEvent {
         key: Key,
         modifiers: Modifiers,
     },
+    TextInput(String),
     MouseMoved {
         x: f64,
         y: f64,
@@ -131,11 +132,12 @@ mod tests {
         let events = vec![
             InputEvent::KeyPressed { key: Key::A, modifiers: Modifiers::NONE },
             InputEvent::KeyReleased { key: Key::B, modifiers: Modifiers::NONE },
+            InputEvent::TextInput("hello".to_string()),
             InputEvent::MouseMoved { x: 0.0, y: 0.0 },
             InputEvent::MouseClicked { button: MouseButton::Right, x: 1.0, y: 2.0 },
             InputEvent::Scroll { delta_x: 0.0, delta_y: -1.0 },
         ];
-        assert_eq!(events.len(), 5);
+        assert_eq!(events.len(), 6);
     }
 
     #[test]
