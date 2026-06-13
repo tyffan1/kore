@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "components/css",
+    "components/gpu",
     "components/html",
     "components/ipc",
     "components/layout",
