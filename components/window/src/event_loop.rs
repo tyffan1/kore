@@ -42,10 +42,10 @@ impl EventLoop {
     where
         F: FnMut(AppEvent, &ActiveEventLoop) + 'static,
     {
+        let mut modifiers = Modifiers::NONE;
         let outcome = self.inner.run(move |event, elwt| {
-            let app_event = Self::map_event(&event);
-            if let Some(ev) = app_event {
-                handler(ev, elwt);
+            for app_event in Self::map_event(&event, &mut modifiers) {
+                handler(app_event, elwt);
             }
         });
         std::process::exit(match outcome {
@@ -54,67 +54,90 @@ impl EventLoop {
         })
     }
 
-    /// Map a winit `Event` to our `AppEvent`.
-    fn map_event(event: &winit::event::Event<()>) -> Option<AppEvent> {
+    /// Map a winit `Event` to zero or more `AppEvent`s.
+    fn map_event(
+        event: &winit::event::Event<()>,
+        modifiers: &mut Modifiers,
+    ) -> Vec<AppEvent> {
         match event {
             winit::event::Event::WindowEvent { event: winit_event, .. } => {
-                Self::map_window_event(winit_event)
+                Self::map_window_event(winit_event, modifiers)
             }
-            winit::event::Event::AboutToWait => Some(AppEvent::Redraw),
-            _ => None,
+            winit::event::Event::AboutToWait => vec![AppEvent::Redraw],
+            _ => vec![],
         }
     }
 
-    /// Map a winit `WindowEvent` to our `AppEvent`.
-    fn map_window_event(event: &winit::event::WindowEvent) -> Option<AppEvent> {
+    /// Map a winit `WindowEvent` to zero or more `AppEvent`s.
+    fn map_window_event(
+        event: &winit::event::WindowEvent,
+        modifiers: &mut Modifiers,
+    ) -> Vec<AppEvent> {
         match event {
-            winit::event::WindowEvent::Resized(size) => Some(AppEvent::Resized {
+            winit::event::WindowEvent::Resized(size) => vec![AppEvent::Resized {
                 width: size.width,
                 height: size.height,
-            }),
-            winit::event::WindowEvent::CloseRequested => Some(AppEvent::CloseRequested),
+            }],
+            winit::event::WindowEvent::CloseRequested => vec![AppEvent::CloseRequested],
             winit::event::WindowEvent::Focused(focused) => {
-                Some(AppEvent::FocusChanged(*focused))
+                vec![AppEvent::FocusChanged(*focused)]
+            }
+            winit::event::WindowEvent::ModifiersChanged(m) => {
+                *modifiers = mods_from_winit(m.state());
+                vec![]
             }
             winit::event::WindowEvent::KeyboardInput { event: ke, .. } => {
                 let key = key_from_winit(&ke.physical_key);
-                let has_text = ke.text.as_ref().is_some_and(|t| !t.is_empty());
-                if has_text && ke.state == winit::event::ElementState::Pressed {
-                    let text = ke.text.as_ref().map(|s| s.to_string()).unwrap_or_default();
-                    Some(AppEvent::Input(InputEvent::TextInput(text)))
-                } else {
-                    let input = match ke.state {
-                        winit::event::ElementState::Pressed => {
-                            InputEvent::KeyPressed {
-                                key,
-                                modifiers: Modifiers::NONE,
-                            }
-                        }
-                        winit::event::ElementState::Released => {
-                            InputEvent::KeyReleased {
-                                key,
-                                modifiers: Modifiers::NONE,
-                            }
-                        }
-                    };
-                    Some(AppEvent::Input(input))
+                let mut events = Vec::new();
+
+                // ALWAYS emit KeyPressed / KeyReleased for the physical key
+                match ke.state {
+                    winit::event::ElementState::Pressed => {
+                        events.push(AppEvent::Input(InputEvent::KeyPressed {
+                            key,
+                            modifiers: *modifiers,
+                        }));
+                    }
+                    winit::event::ElementState::Released => {
+                        events.push(AppEvent::Input(InputEvent::KeyReleased {
+                            key,
+                            modifiers: *modifiers,
+                        }));
+                    }
                 }
+
+                // ALSO emit TextInput if text is available, this is a
+                // printable key, and Ctrl/Meta is NOT held.
+                if ke.state == winit::event::ElementState::Pressed {
+                    if let Some(text) = &ke.text {
+                        if !text.is_empty()
+                            && !is_named_key(key)
+                            && !modifiers.ctrl
+                            && !modifiers.meta
+                        {
+                            events
+                                .push(AppEvent::Input(InputEvent::TextInput(text.to_string())));
+                        }
+                    }
+                }
+
+                events
             }
             winit::event::WindowEvent::CursorMoved { position, .. } => {
-                Some(AppEvent::Input(InputEvent::MouseMoved {
+                vec![AppEvent::Input(InputEvent::MouseMoved {
                     x: position.x,
                     y: position.y,
-                }))
+                })]
             }
             winit::event::WindowEvent::MouseInput { button, state, .. } => {
                 if *state == winit::event::ElementState::Pressed {
-                    Some(AppEvent::Input(InputEvent::MouseClicked {
+                    vec![AppEvent::Input(InputEvent::MouseClicked {
                         button: mouse_button_from_winit(*button),
                         x: 0.0,
                         y: 0.0,
-                    }))
+                    })]
                 } else {
-                    None
+                    vec![]
                 }
             }
             winit::event::WindowEvent::MouseWheel { delta, .. } => {
@@ -124,12 +147,12 @@ impl EventLoop {
                     }
                     winit::event::MouseScrollDelta::PixelDelta(pos) => (pos.x, pos.y),
                 };
-                Some(AppEvent::Input(InputEvent::Scroll {
+                vec![AppEvent::Input(InputEvent::Scroll {
                     delta_x: dx,
                     delta_y: dy,
-                }))
+                })]
             }
-            _ => None,
+            _ => vec![],
         }
     }
 }
@@ -210,6 +233,51 @@ fn key_from_winit(key: &winit::keyboard::PhysicalKey) -> Key {
     }
 }
 
+/// Keys that should only produce `KeyPressed` events, not `TextInput`.
+fn is_named_key(key: Key) -> bool {
+    matches!(
+        key,
+        Key::Enter
+            | Key::Escape
+            | Key::Tab
+            | Key::Backspace
+            | Key::Delete
+            | Key::ArrowUp
+            | Key::ArrowDown
+            | Key::ArrowLeft
+            | Key::ArrowRight
+            | Key::Home
+            | Key::End
+            | Key::PageUp
+            | Key::PageDown
+            | Key::F1
+            | Key::F2
+            | Key::F3
+            | Key::F4
+            | Key::F5
+            | Key::F6
+            | Key::F7
+            | Key::F8
+            | Key::F9
+            | Key::F10
+            | Key::F11
+            | Key::F12
+            | Key::Control
+            | Key::Shift
+            | Key::Alt
+            | Key::Meta
+    )
+}
+
+fn mods_from_winit(mods: winit::keyboard::ModifiersState) -> Modifiers {
+    Modifiers {
+        shift: mods.shift_key(),
+        ctrl: mods.control_key(),
+        alt: mods.alt_key(),
+        meta: mods.super_key(),
+    }
+}
+
 fn mouse_button_from_winit(button: winit::event::MouseButton) -> MouseButton {
     use winit::event::MouseButton as WB;
     match button {
@@ -230,28 +298,28 @@ mod tests {
     #[test]
     fn close_requested_maps_correctly() {
         let we = winit::event::WindowEvent::CloseRequested;
-        let mapped = EventLoop::map_window_event(&we);
-        assert!(matches!(mapped, Some(AppEvent::CloseRequested)));
+        let mapped = EventLoop::map_window_event(&we, &mut Modifiers::NONE);
+        assert!(matches!(mapped[..], [AppEvent::CloseRequested]));
     }
 
     #[test]
     fn resize_maps_correctly() {
         let we = winit::event::WindowEvent::Resized(winit::dpi::PhysicalSize::new(800, 600));
-        let mapped = EventLoop::map_window_event(&we);
+        let mapped = EventLoop::map_window_event(&we, &mut Modifiers::NONE);
         assert!(matches!(
-            mapped,
-            Some(AppEvent::Resized {
+            mapped[..],
+            [AppEvent::Resized {
                 width: 800,
                 height: 600
-            })
+            }]
         ));
     }
 
     #[test]
     fn focus_changed_maps() {
         let we = winit::event::WindowEvent::Focused(true);
-        let mapped = EventLoop::map_window_event(&we);
-        assert!(matches!(mapped, Some(AppEvent::FocusChanged(true))));
+        let mapped = EventLoop::map_window_event(&we, &mut Modifiers::NONE);
+        assert!(matches!(mapped[..], [AppEvent::FocusChanged(true)]));
     }
 
     #[test]
@@ -276,5 +344,43 @@ mod tests {
             winit::keyboard::KeyCode::AudioVolumeUp,
         ));
         assert!(matches!(key, Key::Unknown(_)));
+    }
+
+    #[test]
+    fn named_key_backspace_is_named() {
+        assert!(is_named_key(Key::Backspace));
+    }
+
+    #[test]
+    fn named_key_delete_is_named() {
+        assert!(is_named_key(Key::Delete));
+    }
+
+    #[test]
+    fn letter_key_not_named() {
+        assert!(!is_named_key(Key::V));
+    }
+
+    #[test]
+    fn digit_key_not_named() {
+        assert!(!is_named_key(Key::Digit0));
+    }
+
+    #[test]
+    fn space_not_named() {
+        assert!(!is_named_key(Key::Space));
+    }
+
+    #[test]
+    fn modifiers_changed_updates_state() {
+        let mut mods = Modifiers::NONE;
+        let mut state = winit::keyboard::ModifiersState::empty();
+        state.set(winit::keyboard::ModifiersState::CONTROL, true);
+        let winit_mods = winit::event::Modifiers::from(state);
+        let we = winit::event::WindowEvent::ModifiersChanged(winit_mods);
+        let mapped = EventLoop::map_window_event(&we, &mut mods);
+        assert!(mapped.is_empty());
+        assert!(mods.ctrl);
+        assert!(!mods.shift);
     }
 }

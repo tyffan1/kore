@@ -45,6 +45,7 @@ expect_used = "deny"
 panic = "deny"
 
 [dependencies]
+clipboard = "0.5"
 kore-browser = { path = "components/browser" }
 kore-css = { path = "components/css" }
 kore-gpu = { path = "components/gpu" }

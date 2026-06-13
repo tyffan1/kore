@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::sync::Arc;
 use std::time::Instant;
 
+use clipboard::ClipboardProvider;
 use kore_browser::BrowserApp;
 use kore_gpu::{Color, DisplayCommand, DisplayList, DrawRect, DrawText, Renderer, RendererConfig};
 use kore_pipeline::Pipeline;
@@ -169,25 +170,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn handle_input(state: &mut AppState, event: InputEvent) {
     match event {
-        InputEvent::TextInput(ch) => {
-            if state.address_bar_focused && !ch.is_empty() {
-                handle_text_input(state, &ch);
-            }
-        }
-
         InputEvent::KeyPressed { key, modifiers } => {
+            eprintln!("Key pressed: {:?}", key);
             match key {
                 Key::Control => state.ctrl_pressed = true,
                 Key::Shift => state.shift_pressed = true,
                 _ => {}
             }
 
-            if state.address_bar_focused {
-                handle_address_bar_key(state, key, modifiers);
-                return;
+            // Handle Ctrl shortcuts first, regardless of address bar focus
+            let is_ctrl = modifiers.ctrl || state.ctrl_pressed;
+            if is_ctrl {
+                handle_global_shortcuts(state, key, modifiers);
+                // Return early for shortcuts that shouldn't also reach address bar
+                match key {
+                    Key::T | Key::W | Key::R => return,
+                    _ => {}
+                }
             }
 
-            handle_global_shortcuts(state, key);
+            if state.address_bar_focused {
+                handle_address_bar_key(state, key, modifiers);
+            }
+        }
+
+        InputEvent::TextInput(ch) => {
+            if state.address_bar_focused && !ch.is_empty() {
+                if !state.ctrl_pressed && ch.chars().all(|c| !c.is_control()) {
+                    handle_text_input(state, &ch);
+                }
+            }
         }
 
         InputEvent::KeyReleased { key, .. } => {
@@ -306,6 +318,7 @@ fn delete_selection(state: &mut AppState) {
 }
 
 fn handle_address_bar_key(state: &mut AppState, key: Key, modifiers: Modifiers) {
+    eprintln!("address bar key: {:?}", key);
     let is_ctrl = modifiers.ctrl || state.ctrl_pressed;
     let is_shift = modifiers.shift || state.shift_pressed;
 
@@ -396,12 +409,26 @@ fn handle_address_bar_key(state: &mut AppState, key: Key, modifiers: Modifiers) 
     state.last_cursor_blink = Instant::now();
 }
 
-fn handle_global_shortcuts(state: &mut AppState, key: Key) {
-    if !state.ctrl_pressed {
+fn handle_global_shortcuts(state: &mut AppState, key: Key, modifiers: Modifiers) {
+    if !modifiers.ctrl && !state.ctrl_pressed {
         return;
     }
 
     match key {
+        Key::V => {
+            delete_selection(state);
+            if let Ok(mut ctx) = clipboard::ClipboardContext::new() {
+                if let Ok(text) = ctx.get_contents() {
+                    let mut buf: Vec<char> = state.url_buffer.chars().collect();
+                    for c in text.chars() {
+                        buf.insert(state.cursor_pos, c);
+                        state.cursor_pos += 1;
+                    }
+                    state.url_buffer = buf.into_iter().collect();
+                }
+            }
+            state.selection_start = None;
+        }
         Key::T => {
             let Ok(url) = url::Url::parse("about:blank") else { return };
             let _ = state.browser.open_tab(url);
