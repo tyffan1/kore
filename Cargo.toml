@@ -1,11 +1,13 @@
 [workspace]
 members = [
+    "components/browser",
     "components/css",
     "components/gpu",
     "components/html",
     "components/ipc",
     "components/layout",
     "components/net",
+    "components/sandbox",
 ]
 resolver = "2"
 
