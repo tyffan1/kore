@@ -250,7 +250,6 @@ fn handle_mouse_click(state: &mut AppState, x: f64, y: f64) {
     if in_address_bar {
         state.address_bar_focused = true;
         state.cursor_pos = state.url_buffer.chars().count();
-        state.selection_start = Some(0);
         state.cursor_visible = true;
         state.last_cursor_blink = Instant::now();
     } else {
@@ -643,20 +642,19 @@ fn draw_address_bar(
     let text_x = 40.0;
     let text_y = 53.0;
 
-    let security_icon = if is_secure { "🔒" } else { "⚠️" };
-    let security_color = if is_secure {
-        Color::from_rgba8(0, 150, 0, 255)
+    let (security_char, security_color) = if is_secure {
+        ("S", Color::from_rgba8(0, 150, 0, 255))
     } else {
-        Color::from_rgba8(200, 100, 0, 255)
+        ("!", Color::from_rgba8(200, 100, 0, 255))
     };
     list.push_text(DrawText {
         x: 14.0,
         y: text_y,
-        text: security_icon.to_string(),
+        text: security_char.to_string(),
         font_size,
         color: security_color,
         font_family: Some("sans-serif".to_string()),
-        bold: false,
+        bold: true,
         italic: false,
     });
 

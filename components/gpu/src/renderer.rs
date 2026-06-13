@@ -215,7 +215,14 @@ impl Renderer {
     }
 
     pub fn begin_frame(&self) -> Result<FrameRenderer, GpuError> {
-        let surface_texture = self.surface.get_current_texture()?;
+        let surface_texture = match self.surface.get_current_texture() {
+            Err(wgpu::SurfaceError::Outdated) | Err(wgpu::SurfaceError::Lost) => {
+                self.surface
+                    .configure(&self.device, &self.surface_config);
+                self.surface.get_current_texture()?
+            }
+            other => other?,
+        };
         Ok(FrameRenderer {
             surface_texture,
             rect_vertices: Vec::new(),
