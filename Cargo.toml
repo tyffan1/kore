@@ -1,3 +1,17 @@
+[package]
+name = "kore"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "kore"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
 [workspace]
 members = [
     "components/browser",
@@ -7,8 +21,10 @@ members = [
     "components/ipc",
     "components/layout",
     "components/net",
+    "components/renderer",
     "components/sandbox",
     "components/ui",
+    "components/window",
 ]
 resolver = "2"
 
@@ -25,6 +41,16 @@ unsafe_code = "forbid"
 unwrap_used = "deny"
 expect_used = "deny"
 panic = "deny"
+
+[dependencies]
+kore-browser = { path = "components/browser" }
+kore-gpu = { path = "components/gpu" }
+kore-ui = { path = "components/ui" }
+kore-window = { path = "components/window" }
+pollster = "0.4"
+wgpu = { version = "22", default-features = false, features = ["wgsl", "dx12", "metal", "vulkan-portability"] }
+winit = { version = "0.30", default-features = false }
+url = { workspace = true }
 
 [workspace.dependencies]
 bytes = "1.6"

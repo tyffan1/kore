@@ -36,7 +36,7 @@ pub struct Renderer {
 
 impl Renderer {
     pub async fn new(
-        instance: wgpu::Instance,
+        instance: &wgpu::Instance,
         surface: wgpu::Surface<'static>,
         config: RendererConfig,
     ) -> Result<Self, GpuError> {
