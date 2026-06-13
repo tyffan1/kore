@@ -17,12 +17,15 @@ head, script, style, link, meta, title {
     display: none;
 }
 body {
+    margin: 8px;
     font-size: 16px;
     color: black;
 }
-h1 { font-size: 32px; font-weight: bold; }
-h2 { font-size: 24px; font-weight: bold; }
-h3 { font-size: 18px; font-weight: bold; }
+p { margin: 16px 0; }
+h1 { font-size: 32px; font-weight: bold; margin: 32px 0; }
+h2 { font-size: 24px; font-weight: bold; margin: 24px 0; }
+h3 { font-size: 18px; font-weight: bold; margin: 20px 0; }
+div { margin: 8px 0; }
 b, strong { font-weight: bold; }
 i, em { font-style: italic; }
 "#;
@@ -198,30 +201,42 @@ pub fn build_display_list(document: &kore_html::Document, layout_tree: &LayoutTr
         // Emit text commands for text nodes
         if let Some(dom_id) = node.dom_node_id {
             if let Some(dom_node) = document.node(dom_id) {
-                if let NodeKind::Text(text) = &dom_node.kind {
-                    let trimmed = text.trim();
-                    if !trimmed.is_empty() {
-                        let content_rect = node.content_rect();
-                        let text_color = node
-                            .style
-                            .color
-                            .map(to_gpu_color)
-                            .unwrap_or(Color::BLACK);
-                        let font_size = node.style.font_size.unwrap_or(16.0);
-                        let bold = node.style.font_weight == FontWeight::Bold;
-                        let italic = node.style.font_style == FontStyle::Italic;
+                match &dom_node.kind {
+                    NodeKind::Text(text) => {
+                        let trimmed = text.trim();
+                        if !trimmed.is_empty() {
+                            let content_rect = node.content_rect();
+                            let text_color = node
+                                .style
+                                .color
+                                .map(to_gpu_color)
+                                .unwrap_or(Color::BLACK);
+                            let font_size = node.style.font_size.unwrap_or(16.0);
+                            let bold = node.style.font_weight == FontWeight::Bold;
+                            let italic = node.style.font_style == FontStyle::Italic;
 
-                        dl.push_text(DrawText {
-                            x: content_rect.x,
-                            y: content_rect.y,
-                            text: trimmed.to_string(),
-                            font_size,
-                            color: text_color,
-                            font_family: Some("sans-serif".to_string()),
-                            bold,
-                            italic,
+                            dl.push_text(DrawText {
+                                x: content_rect.x,
+                                y: content_rect.y,
+                                text: trimmed.to_string(),
+                                font_size,
+                                color: text_color,
+                                font_family: Some("sans-serif".to_string()),
+                                bold,
+                                italic,
+                            });
+                        }
+                    }
+                    NodeKind::Element(el) if el.tag_name.eq_ignore_ascii_case("img") => {
+                        dl.push_rect(DrawRect {
+                            x: node.rect.x,
+                            y: node.rect.y,
+                            width: node.rect.width,
+                            height: node.rect.height,
+                            color: Color::from_rgba8(200, 200, 200, 255),
                         });
                     }
+                    _ => {}
                 }
             }
         }
@@ -453,5 +468,106 @@ mod tests {
         if let Some(i) = italic {
             assert!(i.italic, "Italic tag should produce italic text");
         }
+    }
+
+    #[test]
+    fn test_block_elements_stack_vertically() {
+        let (_, _, dl) = run_render(
+            r#"<div>First</div><div>Second</div>"#,
+            "",
+        );
+        let texts = find_text(&dl);
+        let first = texts.iter().find(|t| t.text.contains("First")).unwrap();
+        let second = texts.iter().find(|t| t.text.contains("Second")).unwrap();
+        assert!(second.y > first.y, "second block should be below first");
+    }
+
+    #[test]
+    fn test_inline_elements_share_line() {
+        let (_, _, dl) = run_render(
+            r#"<span>Left</span><span>Right</span>"#,
+            "",
+        );
+        let texts = find_text(&dl);
+        let left = texts.iter().find(|t| t.text.contains("Left")).unwrap();
+        let right = texts.iter().find(|t| t.text.contains("Right")).unwrap();
+        assert!(
+            (right.y - left.y).abs() < 1.0,
+            "inline elements should be on the same line (y difference: {})",
+            (right.y - left.y).abs()
+        );
+    }
+
+    #[test]
+    fn test_heading_margin_gives_vertical_space() {
+        let (_, _, dl) = run_render(
+            r#"<h1>Heading</h1><p>Paragraph</p>"#,
+            "",
+        );
+        let texts = find_text(&dl);
+        let heading = texts.iter().find(|t| t.text.contains("Heading")).unwrap();
+        let para = texts.iter().find(|t| t.text.contains("Paragraph")).unwrap();
+        // h1 default font-size is 32px, so line-height is ~44.8px
+        // h1 margin-bottom is 32px, p margin-top is 16px
+        // Gap from heading baseline to paragraph top should be > line-height
+        let gap = para.y - heading.y;
+        assert!(
+            gap > heading.font_size,
+            "paragraph should be below heading with margin (gap: {})",
+            gap
+        );
+    }
+
+    #[test]
+    fn test_img_placeholder_rect() {
+        let (_, _, dl) = run_render(
+            r#"<img src="photo.jpg" width="200" height="150">"#,
+            "",
+        );
+        let gray = Color::from_rgba8(200, 200, 200, 255);
+        let has_gray = dl.commands().iter().any(|cmd| {
+            if let kore_gpu::DisplayCommand::Rect(r) = cmd {
+                (r.color.r - gray.r).abs() < 0.01
+                    && (r.color.g - gray.g).abs() < 0.01
+                    && (r.color.b - gray.b).abs() < 0.01
+                    && (r.width - 200.0).abs() < 1.0
+                    && (r.height - 150.0).abs() < 1.0
+            } else {
+                false
+            }
+        });
+        assert!(has_gray, "img should have a gray 200x150 placeholder rect");
+    }
+
+    #[test]
+    fn test_img_placeholder_default_size() {
+        let (_, _, dl) = run_render(
+            r#"<img src="photo.jpg">"#,
+            "",
+        );
+        let gray = Color::from_rgba8(200, 200, 200, 255);
+        let has_gray = dl.commands().iter().any(|cmd| {
+            if let kore_gpu::DisplayCommand::Rect(r) = cmd {
+                (r.color.r - gray.r).abs() < 0.01
+                    && (r.color.g - gray.g).abs() < 0.01
+                    && (r.color.b - gray.b).abs() < 0.01
+                    && (r.width - 100.0).abs() < 1.0
+                    && (r.height - 100.0).abs() < 1.0
+            } else {
+                false
+            }
+        });
+        assert!(has_gray, "img should have a gray 100x100 placeholder rect");
+    }
+
+    #[test]
+    fn test_line_height_scales_with_font_size() {
+        let (_, _, dl) = run_render(
+            r#"<p id="big">Text</p>"#,
+            "#big { font-size: 20px; }",
+        );
+        let texts = find_text(&dl);
+        let t = texts.iter().find(|t| t.text.contains("Text")).unwrap();
+        assert!((t.font_size - 20.0).abs() < 0.01, "font size should be 20px");
     }
 }

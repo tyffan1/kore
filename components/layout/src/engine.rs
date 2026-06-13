@@ -6,8 +6,8 @@ use kore_css::{cascade_for_element, ElementSnapshot, StyleSheet};
 use kore_html::{Document, Element, NodeId, NodeKind};
 use thiserror::Error;
 
-const TEXT_ADVANCE: f32 = 8.0;
-const LINE_HEIGHT: f32 = 16.0;
+pub(crate) const LINE_HEIGHT: f32 = 16.0;
+const TEXT_ADVANCE_FACTOR: f32 = 0.6;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LayoutConfig {
@@ -103,6 +103,29 @@ impl<'a> LayoutBuilder<'a> {
                 if style.display == Display::None {
                     return Ok(());
                 }
+                // Img defaults: size from attributes or fallback
+                if element.tag_name.eq_ignore_ascii_case("img") {
+                    if style.width.is_none() {
+                        style.width = element
+                            .attributes
+                            .iter()
+                            .find(|a| a.name.eq_ignore_ascii_case("width"))
+                            .and_then(|a| a.value.parse::<f32>().ok());
+                    }
+                    if style.height.is_none() {
+                        style.height = element
+                            .attributes
+                            .iter()
+                            .find(|a| a.name.eq_ignore_ascii_case("height"))
+                            .and_then(|a| a.value.parse::<f32>().ok());
+                    }
+                    if style.width.is_none() {
+                        style.width = Some(100.0);
+                    }
+                    if style.height.is_none() {
+                        style.height = Some(100.0);
+                    }
+                }
                 // Inherit from parent layout node
                 inherit_from_parent(&mut style, &self.nodes, parent);
                 let layout_id = self.push_node(Some(dom_id), Some(parent), style);
@@ -113,11 +136,14 @@ impl<'a> LayoutBuilder<'a> {
             NodeKind::Text(text) if !text.trim().is_empty() => {
                 let mut style = ComputedStyle {
                     display: Display::Inline,
-                    width: Some(text_width(text)),
-                    height: Some(LINE_HEIGHT),
+                    width: None,
+                    height: None,
                     ..ComputedStyle::default()
                 };
                 inherit_from_parent(&mut style, &self.nodes, parent);
+                let font_size = style.font_size.unwrap_or(16.0);
+                style.width = Some(text_width(text, font_size));
+                style.height = Some(font_size * 1.4);
                 self.push_node(Some(dom_id), Some(parent), style);
             }
             NodeKind::Document
@@ -174,7 +200,12 @@ fn layout_node(
     match display {
         Display::Flex => layout_flex(nodes, id, x, y, containing_width, containing_height),
         Display::Inline | Display::InlineBlock => {
-            let width = preferred_width(&nodes[id.0], containing_width);
+            // Inline without explicit width: shrink-to-fit (width = 0 so children determine it)
+            let width = if matches!(display, Display::Inline) && nodes[id.0].style.width.is_none() {
+                0.0
+            } else {
+                preferred_width(&nodes[id.0], containing_width)
+            };
             let height = preferred_height(&nodes[id.0], LINE_HEIGHT);
             // Lay out children as inline content
             let children = nodes[id.0].children.clone();
@@ -217,7 +248,11 @@ fn layout_block(
     for child in children {
         let child_display = nodes[child.0].style.display;
         if matches!(child_display, Display::Inline | Display::InlineBlock) {
-            let child_width = preferred_width(&nodes[child.0], content_width);
+            let child_width = if matches!(child_display, Display::Inline) && nodes[child.0].style.width.is_none() {
+                0.0
+            } else {
+                preferred_width(&nodes[child.0], content_width)
+            };
             let child_height = preferred_height(&nodes[child.0], LINE_HEIGHT);
             if line_x > content_x && line_x + child_width > content_x + content_width {
                 cursor_y += line_height;
@@ -226,7 +261,12 @@ fn layout_block(
                 line_height = 0.0;
             }
             layout_node(nodes, child, line_x, line_y, child_width, child_height)?;
-            line_x += child_width;
+            let adv_width = if matches!(child_display, Display::Inline) {
+                nodes[child.0].rect.width
+            } else {
+                child_width
+            };
+            line_x += adv_width;
             line_height = line_height.max(child_height);
         } else {
             if line_height > 0.0 {
@@ -477,8 +517,8 @@ fn default_display(tag_name: &str) -> Display {
     }
 }
 
-fn text_width(text: &str) -> f32 {
-    text.chars().count() as f32 * TEXT_ADVANCE
+fn text_width(text: &str, font_size: f32) -> f32 {
+    text.chars().count() as f32 * font_size * TEXT_ADVANCE_FACTOR
 }
 
 /// Inherit CSS properties that cascade by default from the parent layout node.
