@@ -8,6 +8,7 @@ members = [
     "components/layout",
     "components/net",
     "components/sandbox",
+    "components/ui",
 ]
 resolver = "2"
 
