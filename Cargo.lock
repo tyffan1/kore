@@ -1106,6 +1106,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "kore-devtools"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror 1.0.69",
+ "url",
+]
+
+[[package]]
 name = "kore-extensions"
 version = "0.1.0"
 dependencies = [

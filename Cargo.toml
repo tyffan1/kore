@@ -16,6 +16,7 @@ workspace = true
 members = [
     "components/browser",
     "components/css",
+    "components/devtools",
     "components/extensions",
     "components/font",
     "components/gpu",
