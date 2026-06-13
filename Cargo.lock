@@ -394,6 +394,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "kore-layout"
+version = "0.1.0"
+dependencies = [
+ "kore-css",
+ "kore-html",
+ "serde",
+ "thiserror",
+]
+
+[[package]]
 name = "kore-net"
 version = "0.1.0"
 dependencies = [

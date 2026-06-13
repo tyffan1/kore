@@ -3,6 +3,7 @@ members = [
     "components/css",
     "components/html",
     "components/ipc",
+    "components/layout",
     "components/net",
 ]
 resolver = "2"
