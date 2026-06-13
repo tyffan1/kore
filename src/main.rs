@@ -14,6 +14,7 @@ struct AppState {
     rt: tokio::runtime::Runtime,
     display_list: DisplayList,
     content_display_list: DisplayList,
+    page_links: Vec<(f32, f32, f32, f32, String)>,
     address_bar_focused: bool,
     url_buffer: String,
     cursor_pos: usize,
@@ -61,6 +62,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         rt,
         display_list: DisplayList::new(),
         content_display_list: DisplayList::new(),
+        page_links: Vec::new(),
         address_bar_focused: false,
         url_buffer: String::new(),
         cursor_pos: 0,
@@ -294,6 +296,21 @@ fn handle_mouse_click(state: &mut AppState, x: f64, y: f64) {
             let url = active.url.clone();
             navigate(state, url);
         }
+        return;
+    }
+
+    // Check page links
+    for (lx, ly, lw, lh, href) in &state.page_links {
+        if x >= *lx as f64
+            && x <= (*lx + *lw) as f64
+            && y >= (*ly + 84.0) as f64
+            && y <= (*ly + 84.0 + *lh) as f64
+        {
+            if let Ok(url) = parse_url(href) {
+                navigate(state, url);
+            }
+            break;
+        }
     }
 }
 
@@ -512,6 +529,7 @@ fn find_word_end(s: &str, pos: usize) -> usize {
 fn navigate(state: &mut AppState, url: url::Url) {
     if url.as_str() == "about:blank" || url.as_str() == "about:newtab" {
         state.content_display_list.clear();
+        state.page_links.clear();
         state.page_title = None;
         return;
     }
@@ -528,6 +546,7 @@ fn navigate(state: &mut AppState, url: url::Url) {
     };
 
     state.content_display_list = render_output.display_list;
+    state.page_links = render_output.links;
     state.page_title = render_output.title;
     state.loading = false;
 }

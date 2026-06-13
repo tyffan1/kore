@@ -34,6 +34,7 @@ i, em { font-style: italic; }
 pub struct RenderOutput {
     pub display_list: DisplayList,
     pub title: Option<String>,
+    pub links: Vec<(f32, f32, f32, f32, String)>,
 }
 
 /// The render pipeline: fetch HTML → parse → find CSS → fetch CSS → cascade → layout → display list.
@@ -85,8 +86,9 @@ impl Pipeline {
         )?;
 
         let display_list = build_display_list(&document, &layout_tree);
+        let links = extract_links(&document, &layout_tree);
 
-        Ok(RenderOutput { display_list, title })
+        Ok(RenderOutput { display_list, title, links })
     }
 
     async fn fetch_html(&self, url: &Url) -> Result<String, PipelineError> {
@@ -165,6 +167,50 @@ fn default_bg_color(tag_name: &str) -> Option<Color> {
         "html" | "body" => Some(Color::from_rgba8(255, 255, 255, 255)),
         _ => None,
     }
+}
+
+/// Extract clickable link regions from the layout tree.
+pub fn extract_links(
+    document: &kore_html::Document,
+    layout_tree: &LayoutTree,
+) -> Vec<(f32, f32, f32, f32, String)> {
+    let mut links = Vec::new();
+    for node in &layout_tree.nodes {
+        if node.rect.width <= 0.0 || node.rect.height <= 0.0 {
+            continue;
+        }
+        let Some(dom_id) = node.dom_node_id else { continue };
+        let Some(dom_node) = document.node(dom_id) else { continue };
+        let NodeKind::Element(el) = &dom_node.kind else { continue };
+        if !el.tag_name.eq_ignore_ascii_case("a") {
+            continue;
+        }
+        let Some(href) = el.attributes.iter().find(|a| a.name.eq_ignore_ascii_case("href")) else {
+            continue;
+        };
+        let text_content: String = dom_node
+            .children
+            .iter()
+            .filter_map(|child_id| document.node(*child_id))
+            .filter_map(|child| {
+                if let NodeKind::Text(t) = &child.kind {
+                    Some(t.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<&str>>()
+            .join("");
+        let trimmed = text_content.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let font_size = node.style.font_size.unwrap_or(16.0);
+        let link_w = trimmed.chars().count() as f32 * font_size * 0.6;
+        let link_h = font_size * 1.4;
+        links.push((node.rect.x, node.rect.y, link_w, link_h, href.value.clone()));
+    }
+    links
 }
 
 /// Build a DisplayList from a LayoutTree and its associated DOM.
