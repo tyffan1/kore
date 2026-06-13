@@ -20,6 +20,7 @@ members = [
     "components/gpu",
     "components/html",
     "components/ipc",
+    "components/js",
     "components/layout",
     "components/net",
     "components/pipeline",
