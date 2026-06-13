@@ -4,13 +4,14 @@ use std::time::Instant;
 
 use clipboard::ClipboardProvider;
 use kore_browser::BrowserApp;
-use kore_gpu::{Color, DisplayCommand, DisplayList, DrawRect, DrawText, Renderer, RendererConfig};
+use kore_gpu::{ClipRect, Color, DisplayCommand, DisplayList, DrawRect, DrawText, Renderer, RendererConfig};
 use kore_pipeline::Pipeline;
 use kore_window::{AppEvent, EventLoop, InputEvent, Key, Modifiers, MouseButton, WindowBuilder, WindowHandle};
 
 struct AppState {
     browser: BrowserApp,
     pipeline: Pipeline,
+    rt: tokio::runtime::Runtime,
     display_list: DisplayList,
     content_display_list: DisplayList,
     address_bar_focused: bool,
@@ -28,6 +29,8 @@ struct AppState {
     back_button_hover: bool,
     forward_button_hover: bool,
     reload_button_hover: bool,
+    window_width: f32,
+    window_height: f32,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -51,9 +54,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
     let el = EventLoop::new()?;
 
+    let rt = tokio::runtime::Runtime::new().unwrap();
     let state = RefCell::new(AppState {
         browser,
         pipeline: Pipeline::default(),
+        rt,
         display_list: DisplayList::new(),
         content_display_list: DisplayList::new(),
         address_bar_focused: false,
@@ -71,6 +76,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         back_button_hover: false,
         forward_button_hover: false,
         reload_button_hover: false,
+        window_width: 1280.0,
+        window_height: 720.0,
     });
 
     let window = RefCell::new(None::<Arc<winit::window::Window>>);
@@ -150,6 +157,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             AppEvent::Resized { width, height } => {
+                state.borrow_mut().window_width = width as f32;
+                state.borrow_mut().window_height = height as f32;
                 if let Some(r) = renderer.borrow_mut().as_mut() {
                     r.resize(width, height);
                 }
@@ -171,7 +180,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn handle_input(state: &mut AppState, event: InputEvent) {
     match event {
         InputEvent::KeyPressed { key, modifiers } => {
-            eprintln!("Key pressed: {:?}", key);
             match key {
                 Key::Control => state.ctrl_pressed = true,
                 Key::Shift => state.shift_pressed = true,
@@ -318,7 +326,6 @@ fn delete_selection(state: &mut AppState) {
 }
 
 fn handle_address_bar_key(state: &mut AppState, key: Key, modifiers: Modifiers) {
-    eprintln!("address bar key: {:?}", key);
     let is_ctrl = modifiers.ctrl || state.ctrl_pressed;
     let is_shift = modifiers.shift || state.shift_pressed;
 
@@ -511,7 +518,7 @@ fn navigate(state: &mut AppState, url: url::Url) {
 
     state.loading = true;
 
-    let render_output = match state.pipeline.render(&url) {
+    let render_output = match state.rt.block_on(state.pipeline.render(&url)) {
         Ok(output) => output,
         Err(e) => {
             eprintln!("Render pipeline error: {e}");
@@ -526,8 +533,8 @@ fn navigate(state: &mut AppState, url: url::Url) {
 }
 
 fn build_display_list(state: &mut AppState) {
-    let width = 1280.0;
-    let height = 720.0;
+    let width = state.window_width;
+    let height = state.window_height;
 
     let list = &mut state.display_list;
     list.clear();
@@ -630,6 +637,13 @@ fn build_display_list(state: &mut AppState) {
         color: Color::from_rgba8(255, 255, 255, 255),
     });
 
+    list.push_clip(ClipRect {
+        x: 8.0,
+        y: content_area_y,
+        width: width - 16.0,
+        height: content_area_h,
+    });
+
     for cmd in state.content_display_list.commands() {
         match cmd {
             DisplayCommand::Rect(rect) => {
@@ -642,18 +656,21 @@ fn build_display_list(state: &mut AppState) {
                 });
             }
             DisplayCommand::Text(text) => {
-                let tw = text.text.chars().count() as f32 * text.font_size * 0.6;
-                list.push_rect(DrawRect {
-                    x: 8.0 + text.x,
+                let render_x = 8.0 + text.x;
+                if render_x > width - 20.0 {
+                    continue;
+                }
+                list.push_text(DrawText {
+                    x: render_x,
                     y: content_area_y + text.y,
-                    width: tw,
-                    height: text.font_size,
-                    color: text.color,
+                    ..text.clone()
                 });
             }
             _ => {}
         }
     }
+
+    list.pop_clip();
 }
 
 fn draw_address_bar(

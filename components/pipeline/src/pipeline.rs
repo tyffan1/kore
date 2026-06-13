@@ -54,8 +54,8 @@ impl Pipeline {
     }
 
     /// Run the full pipeline: fetch, parse, style, layout, and build a display list.
-    pub fn render(&self, url: &Url) -> Result<RenderOutput, PipelineError> {
-        let html_str = self.fetch_html(url)?;
+    pub async fn render(&self, url: &Url) -> Result<RenderOutput, PipelineError> {
+        let html_str = self.fetch_html(url).await?;
         let document = parse_document(&html_str)?;
 
         let title = page_title(&document);
@@ -63,7 +63,7 @@ impl Pipeline {
         let mut stylesheets = vec![DEFAULT_CSS.to_string()];
 
         for css_url in linked_stylesheets(&document, url) {
-            if let Ok(css) = self.fetch_css(&css_url) {
+            if let Ok(css) = self.fetch_css(&css_url).await {
                 stylesheets.push(css);
             }
         }
@@ -86,18 +86,18 @@ impl Pipeline {
         Ok(RenderOutput { display_list, title })
     }
 
-    fn fetch_html(&self, url: &Url) -> Result<String, PipelineError> {
+    async fn fetch_html(&self, url: &Url) -> Result<String, PipelineError> {
         if is_about_blank(url) {
             return Ok(String::new());
         }
         let request = FetchRequest::get(url.as_str())?;
-        let response = pollster::block_on(self.http_client.fetch(request))?;
+        let response = self.http_client.fetch(request).await?;
         String::from_utf8(response.body.to_vec()).map_err(|_| PipelineError::InvalidUtf8)
     }
 
-    fn fetch_css(&self, url: &Url) -> Result<String, PipelineError> {
+    async fn fetch_css(&self, url: &Url) -> Result<String, PipelineError> {
         let request = FetchRequest::get(url.as_str())?;
-        let response = pollster::block_on(self.http_client.fetch(request))?;
+        let response = self.http_client.fetch(request).await?;
         String::from_utf8(response.body.to_vec()).map_err(|_| PipelineError::InvalidUtf8)
     }
 }

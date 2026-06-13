@@ -174,7 +174,13 @@ impl Renderer {
             ],
         });
 
-        let font_data: &[u8] = include_bytes!("C:/Windows/Fonts/arial.ttf");
+        #[cfg(target_os = "windows")]
+        const FONT_DATA: &[u8] = include_bytes!("C:/Windows/Fonts/arial.ttf");
+        #[cfg(target_os = "macos")]
+        const FONT_DATA: &[u8] = include_bytes!("/System/Library/Fonts/Helvetica.ttc");
+        #[cfg(target_os = "linux")]
+        const FONT_DATA: &[u8] = include_bytes!("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf");
+        let font_data: &[u8] = FONT_DATA;
         let mut font_cache = FontCache::new();
         let font_desc = FontDescription::new("Arial", false, false);
         let font_id = font_cache

@@ -17,7 +17,6 @@ kore-gpu = { path = "../gpu" }
 kore-html = { path = "../html" }
 kore-layout = { path = "../layout" }
 kore-net = { path = "../net" }
-pollster = "0.4"
 serde.workspace = true
 thiserror.workspace = true
 url.workspace = true

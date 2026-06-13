@@ -82,6 +82,10 @@ pub enum HttpError {
     Body(#[from] hyper::Error),
     #[error("response body exceeded configured limit of {limit} bytes")]
     BodyTooLarge { limit: usize },
+    #[error("exceeded maximum number of redirects ({0})")]
+    TooManyRedirects(u8),
+    #[error("redirect location header is invalid")]
+    InvalidRedirectLocation,
 }
 
 type HttpsClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, Empty<Bytes>>;
@@ -116,18 +120,40 @@ impl HttpClient {
     pub async fn fetch(&self, request: FetchRequest) -> Result<FetchResponse, HttpError> {
         self.config.policy.validate_url(&request.url)?;
 
-        let uri = Uri::from_str(request.url.as_str())?;
-        let hyper_request = Request::builder()
-            .method(hyper::Method::from(request.method))
-            .uri(uri)
-            .header(
-                hyper::header::USER_AGENT,
-                self.config.policy.user_agent.as_str(),
-            )
-            .body(Empty::<Bytes>::new())?;
+        let mut url = request.url;
+        let method = hyper::Method::from(request.method);
+        let mut remaining = 10u8;
 
-        let response = self.inner.request(hyper_request).await?;
-        self.collect_response(request.url, response).await
+        loop {
+            let uri = Uri::from_str(url.as_str())?;
+            let hyper_request = Request::builder()
+                .method(method.clone())
+                .uri(uri)
+                .header(
+                    hyper::header::USER_AGENT,
+                    self.config.policy.user_agent.as_str(),
+                )
+                .body(Empty::<Bytes>::new())?;
+
+            let response = self.inner.request(hyper_request).await?;
+            let status = response.status();
+
+            if status.is_redirection() && remaining > 0 {
+                if let Some(location) = response.headers().get(hyper::header::LOCATION) {
+                    let location_str = location
+                        .to_str()
+                        .map_err(|_| HttpError::InvalidRedirectLocation)?;
+                    let new_url = url
+                        .join(location_str)
+                        .map_err(|_| HttpError::InvalidRedirectLocation)?;
+                    url = new_url;
+                    remaining -= 1;
+                    continue;
+                }
+            }
+
+            return self.collect_response(url, response).await;
+        }
     }
 
     async fn collect_response(

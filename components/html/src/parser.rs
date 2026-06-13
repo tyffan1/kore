@@ -45,7 +45,10 @@ impl HtmlParser {
             Token::EndTag(name) => self.end_tag(&name),
             Token::Text(text) => {
                 if !text.is_empty() {
-                    self.document.append(self.current(), NodeKind::Text(text));
+                    let text = decode_entities(&text);
+                    if !text.is_empty() {
+                        self.document.append(self.current(), NodeKind::Text(text));
+                    }
                 }
             }
             Token::Comment(comment) => {
@@ -126,6 +129,70 @@ impl HtmlParser {
 
 pub fn parse_document(input: &str) -> Result<Document, TokenizerError> {
     HtmlParser::parse(input)
+}
+
+fn decode_entities(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '&' {
+            let start = i;
+            i += 1;
+            if i < chars.len() && chars[i] == '#' {
+                i += 1;
+                let base = if i < chars.len() && chars[i] == 'x' {
+                    i += 1;
+                    16
+                } else {
+                    10
+                };
+                let num_start = i;
+                while i < chars.len() && chars[i] != ';' {
+                    i += 1;
+                }
+                let num_str: String = chars[num_start..i].iter().collect();
+                if i < chars.len() && chars[i] == ';' {
+                    i += 1;
+                }
+                if let Ok(codepoint) = u32::from_str_radix(&num_str, base) {
+                    if let Some(c) = char::from_u32(codepoint) {
+                        out.push(c);
+                    }
+                }
+            } else {
+                let name_start = i;
+                while i < chars.len() && chars[i] != ';' && (chars[i].is_alphanumeric() || chars[i] == '#') {
+                    i += 1;
+                }
+                let name: String = chars[name_start..i].iter().collect();
+                let semicolon = i < chars.len() && chars[i] == ';';
+                if semicolon {
+                    i += 1;
+                }
+                let decoded = match name.as_str() {
+                    "amp" => Some('&'),
+                    "lt" => Some('<'),
+                    "gt" => Some('>'),
+                    "nbsp" => Some('\u{00a0}'),
+                    "quot" => Some('"'),
+                    "copy" => Some('\u{00a9}'),
+                    _ => None,
+                };
+                if let Some(c) = decoded {
+                    out.push(c);
+                } else {
+                    for c in &chars[start..i] {
+                        out.push(*c);
+                    }
+                }
+            }
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    out
 }
 
 #[cfg(test)]
