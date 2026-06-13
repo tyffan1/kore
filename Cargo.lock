@@ -1106,6 +1106,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "kore-extensions"
+version = "0.1.0"
+dependencies = [
+ "kore-ipc",
+ "kore-sandbox",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "url",
+]
+
+[[package]]
 name = "kore-font"
 version = "0.1.0"
 dependencies = [
