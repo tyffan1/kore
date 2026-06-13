@@ -4,9 +4,13 @@ A Firefox-inspired browser built in Rust with a multi-process architecture.
 
 ## Current status
 
-Early development. `cargo run` opens a real window with a toolbar, tab bar, and
-address bar. The navigation pipeline fetches URLs via HTTPS, parses HTML and
-CSS, computes layout, and renders the result via wgpu.
+**205/205 tests passing** — builds on Windows and macOS.
+
+`cargo run` opens a real window with a toolbar, tab bar, and address bar.
+The navigation pipeline fetches URLs via HTTPS, parses HTML and CSS,
+computes layout, and renders the result via wgpu. Real pages load and
+render (google.com tested). Cyrillic text displays correctly via HTML
+entity decoding.
 
 ## Architecture
 
@@ -17,6 +21,7 @@ Multi-process design inspired by Firefox:
   messages and paints via wgpu
 - **Network process** — (future) isolated HTTP/HTTPS stack
 - **GPU process** — (future) wgpu compositor in a dedicated process
+- **Extension process** — sandboxed child process per WebExtension
 
 Inter-process communication uses typed IPC over platform-native transports
 (Named Pipes on Windows, Unix sockets on Linux/macOS) with serde + bincode
@@ -26,17 +31,22 @@ serialization.
 
 | Crate | Description | Tests |
 |---|---|---|
-| kore-html | HTML5 parser (tokenizer + tree builder) | 4 |
-| kore-net | HTTP/HTTPS client with rustls | 4 |
-| kore-css | CSS3 parser, specificity calculator, cascade | 8 |
+| kore-html | HTML5 tokenizer, tree builder, entity decoding | 4 |
+| kore-net | HTTP/HTTPS client with rustls, redirect following | 4 |
+| kore-css | CSS3 parser, specificity, cascade, color parsing | 16 |
 | kore-ipc | Typed IPC with serde+bincode, async Sender/Receiver | 8 |
 | kore-layout | Box model, flexbox, computed layout tree | 4 |
-| kore-gpu | wgpu display list, rect pipeline, texture atlas stub | 9 |
-| kore-sandbox | Process isolation, policy builder, job objects | 8 |
-| kore-browser | Tab manager, session save/restore, renderer process | 19 |
+| kore-gpu | wgpu display list, rect pipeline, font rendering via fontdue | 9 |
+| kore-sandbox | Process isolation, policy builder, cross-platform | 8 |
+| kore-browser | Tab manager, session save/restore, history, renderer process | 24 |
 | kore-ui | Toolbar, tabs, omnibox, theme system | 5 |
-| kore-window | winit integration, input events, window handle | 22 |
-| **Total** | | **91** |
+| kore-window | winit integration, input events, window handle | 28 |
+| kore-pipeline | DOM→CSS→layout→display list render pipeline | 15 |
+| kore-font | fontdue rasterizer, glyph cache, text shaping | 20 |
+| kore-js | QuickJS engine, DOM bindings, script execution | 14 |
+| kore-extensions | WebExtensions API, manifest v2 parsing, sandboxed processes | 17 |
+| kore-devtools | Elements inspector, console capture, network log, storage stubs | 33 |
+| **Total** | | **205** |
 
 ## Prerequisites
 
@@ -54,10 +64,11 @@ cargo run
 
 ## Roadmap
 
-- Real page rendering (inline text, images, CSS backgrounds)
-- JavaScript engine integration
-- Browser extension system
-- Installer and platform packaging
+- Improved CSS rendering (flexbox edge cases, positioned elements)
+- More complete JS DOM API (element manipulation, events)
+- Privacy features (tracking protection, Enhanced Tracking Protection)
+- Web compatibility (form submission, media elements, iframes)
+- Installer (Windows .msi, macOS .dmg, Linux AppImage)
 
 ## License
 
