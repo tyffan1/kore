@@ -1,7 +1,25 @@
-use quick_js::{Context, ExecutionError, JsValue as QJsValue};
+use std::cell::RefCell;
+use std::collections::HashMap;
+
+use boa_engine::error::JsError as BoaJsError;
+use boa_engine::native_function::NativeFunction;
+use boa_engine::object::JsObject;
+use boa_engine::property::PropertyKey;
+use boa_engine::string::JsString;
+use boa_engine::{Context, JsValue as BoaValue, Source};
 use thiserror::Error;
 
-pub use quick_js::JsValue;
+#[derive(Debug, Clone, PartialEq)]
+pub enum JsValue {
+    Undefined,
+    Null,
+    Bool(bool),
+    Int(i32),
+    Float(f64),
+    String(String),
+    Array(Vec<JsValue>),
+    Object(HashMap<String, JsValue>),
+}
 
 #[derive(Debug, Error)]
 pub enum JsError {
@@ -11,50 +29,56 @@ pub enum JsError {
     Execution(String),
 }
 
-impl From<quick_js::ContextError> for JsError {
-    fn from(e: quick_js::ContextError) -> Self {
-        JsError::Context(e.to_string())
-    }
-}
-
-impl From<ExecutionError> for JsError {
-    fn from(e: ExecutionError) -> Self {
+impl From<BoaJsError> for JsError {
+    fn from(e: BoaJsError) -> Self {
         JsError::Execution(e.to_string())
     }
 }
 
 pub struct JsRuntime {
-    context: Context,
+    context: RefCell<Context>,
 }
 
 impl JsRuntime {
     pub fn new() -> Result<Self, JsError> {
-        let context = Context::new()?;
-        let rt = Self { context };
+        let context = Context::default();
+        let rt = Self {
+            context: RefCell::new(context),
+        };
         rt.init_bindings()?;
         Ok(rt)
     }
 
-    pub fn eval(&self, code: &str) -> Result<QJsValue, JsError> {
-        Ok(self.context.eval(code)?)
+    pub fn eval(&self, code: &str) -> Result<JsValue, JsError> {
+        let mut ctx = self.context.borrow_mut();
+        let source = Source::from_bytes(code);
+        let result = ctx.eval(source).map_err(JsError::from)?;
+        Ok(boa_to_our_value(&result, &mut ctx))
     }
 
     fn init_bindings(&self) -> Result<(), JsError> {
-        self.context.add_callback("__console_log", |args: Vec<QJsValue>| {
-            let parts: Vec<String> = args.iter().map(|v| js_value_debug(v)).collect();
+        let mut ctx = self.context.borrow_mut();
+
+        let console_log = NativeFunction::from_fn_ptr(|_, args, context| {
+            let parts: Vec<String> = args.iter().map(|v| boa_debug_value(v, context)).collect();
             eprintln!("[JS] {}", parts.join(" "));
-            QJsValue::Undefined
-        })?;
+            Ok(BoaValue::Undefined)
+        });
+        ctx.register_global_callable(JsString::from("__console_log"), 1, console_log)
+            .map_err(|e| JsError::Context(e.to_string()))?;
 
-        self.context.add_callback(
-            "__document_set_title",
-            |title: String| -> Result<QJsValue, String> {
-                eprintln!("[JS] document.title = '{title}'");
-                Ok(QJsValue::Undefined)
-            },
-        )?;
+        let doc_set_title = NativeFunction::from_fn_ptr(|_, args, _| {
+            if let Some(title) = args.first() {
+                if let Some(s) = title.as_string() {
+                    eprintln!("[JS] document.title = '{}'", s.to_std_string_escaped());
+                }
+            }
+            Ok(BoaValue::Undefined)
+        });
+        ctx.register_global_callable(JsString::from("__document_set_title"), 1, doc_set_title)
+            .map_err(|e| JsError::Context(e.to_string()))?;
 
-        self.context.eval(
+        ctx.eval(Source::from_bytes(
             r#"
 var console = {
     log: function() {
@@ -71,30 +95,103 @@ var document = (function() {
     };
 })();
 "#,
-        )?;
+        ))
+        .map_err(|e| JsError::Context(e.to_string()))?;
 
         Ok(())
     }
 }
 
-fn js_value_debug(val: &QJsValue) -> String {
+fn boa_to_our_value(val: &BoaValue, context: &mut Context) -> JsValue {
     match val {
-        QJsValue::Undefined => "undefined".to_string(),
-        QJsValue::Null => "null".to_string(),
-        QJsValue::Bool(b) => b.to_string(),
-        QJsValue::Int(n) => n.to_string(),
-        QJsValue::Float(f) => format!("{f}"),
-        QJsValue::String(s) => s.clone(),
-        QJsValue::Array(arr) => {
-            let items: Vec<String> = arr.iter().map(|v| js_value_debug(v)).collect();
-            format!("[{}]", items.join(", "))
+        BoaValue::Undefined => JsValue::Undefined,
+        BoaValue::Null => JsValue::Null,
+        BoaValue::Boolean(b) => JsValue::Bool(*b),
+        BoaValue::Integer(i) => JsValue::Int(*i),
+        BoaValue::Rational(f) => JsValue::Float(*f),
+        BoaValue::String(s) => JsValue::String(s.to_std_string_escaped()),
+        BoaValue::Object(obj) => convert_object(obj, context),
+        _ => JsValue::Undefined,
+    }
+}
+
+fn convert_object(obj: &JsObject, context: &mut Context) -> JsValue {
+    if obj.is_array() {
+        convert_array(obj, context)
+    } else if obj.is_callable() {
+        JsValue::Undefined
+    } else {
+        convert_plain_object(obj, context)
+    }
+}
+
+fn convert_array(obj: &JsObject, context: &mut Context) -> JsValue {
+    let length_val = match obj
+        .get(PropertyKey::from(JsString::from("length")), context)
+    {
+        Ok(v) => match v.as_number() {
+            Some(n) => n as usize,
+            None => 0,
+        },
+        Err(_) => 0,
+    };
+    let mut items = Vec::with_capacity(length_val);
+    for i in 0..length_val {
+        let elem = match obj.get(i as u32, context) {
+            Ok(v) => boa_to_our_value(&v, context),
+            Err(_) => JsValue::Undefined,
+        };
+        items.push(elem);
+    }
+    JsValue::Array(items)
+}
+
+fn convert_plain_object(obj: &JsObject, context: &mut Context) -> JsValue {
+    let mut map = HashMap::new();
+    if let Ok(keys) = obj.own_property_keys(context) {
+        for key in keys {
+            let key_str = match &key {
+                PropertyKey::String(s) => s.to_std_string_escaped(),
+                PropertyKey::Index(i) => i.get().to_string(),
+                _ => continue,
+            };
+            if let Ok(val) = obj.get(key, context) {
+                map.insert(key_str, boa_to_our_value(&val, context));
+            }
         }
-        QJsValue::Object(map) => {
-            let items: Vec<String> = map
-                .iter()
-                .map(|(k, v)| format!("\"{k}\": {}", js_value_debug(v)))
-                .collect();
-            format!("{{{}}}", items.join(", "))
+    }
+    JsValue::Object(map)
+}
+
+fn boa_debug_value(val: &BoaValue, context: &mut Context) -> String {
+    match val {
+        BoaValue::Undefined => "undefined".to_string(),
+        BoaValue::Null => "null".to_string(),
+        BoaValue::Boolean(b) => b.to_string(),
+        BoaValue::Integer(i) => i.to_string(),
+        BoaValue::Rational(f) => format!("{f}"),
+        BoaValue::String(s) => s.to_std_string_escaped(),
+        BoaValue::Object(obj) => {
+            if obj.is_array() {
+                let mut items = Vec::new();
+                if let Ok(length) =
+                    obj.get(PropertyKey::from(JsString::from("length")), context)
+                {
+                    if let Some(len) = length.as_number() {
+                        let len = len as usize;
+                        for i in 0..len {
+                            if let Ok(elem) = obj.get(i as u32, context) {
+                                items.push(boa_debug_value(&elem, context));
+                            }
+                        }
+                    }
+                }
+                format!("[{}]", items.join(", "))
+            } else if obj.is_callable() {
+                "function".to_string()
+            } else {
+                "[object Object]".to_string()
+            }
         }
         _ => String::new(),
     }
@@ -104,6 +201,8 @@ fn js_value_debug(val: &QJsValue) -> String {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    type QJsValue = JsValue;
 
     #[test]
     fn eval_returns_undefined() -> Result<(), JsError> {

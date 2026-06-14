@@ -32,6 +32,8 @@ struct AppState {
     reload_button_hover: bool,
     window_width: f32,
     window_height: f32,
+    scroll_y: f32,
+    content_height: f32,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -80,6 +82,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         reload_button_hover: false,
         window_width: 1280.0,
         window_height: 720.0,
+        scroll_y: 0.0,
+        content_height: 0.0,
     });
 
     let window = RefCell::new(None::<Arc<winit::window::Window>>);
@@ -201,6 +205,8 @@ fn handle_input(state: &mut AppState, event: InputEvent) {
 
             if state.address_bar_focused {
                 handle_address_bar_key(state, key, modifiers);
+            } else {
+                handle_scroll_key(state, key);
             }
         }
 
@@ -227,6 +233,11 @@ fn handle_input(state: &mut AppState, event: InputEvent) {
 
         InputEvent::MouseClicked { button: MouseButton::Left, .. } => {
             handle_mouse_click(state, state.mouse_x, state.mouse_y);
+        }
+
+        InputEvent::Scroll { delta_y, .. } => {
+            let new_scroll = state.scroll_y - delta_y as f32;
+            state.scroll_y = new_scroll.max(0.0);
         }
 
         _ => {}
@@ -300,11 +311,12 @@ fn handle_mouse_click(state: &mut AppState, x: f64, y: f64) {
     }
 
     // Check page links
+    let sy = state.scroll_y;
     for (lx, ly, lw, lh, href) in &state.page_links {
         if x >= *lx as f64
             && x <= (*lx + *lw) as f64
-            && y >= (*ly + 84.0) as f64
-            && y <= (*ly + 84.0 + *lh) as f64
+            && y >= (*ly + 84.0 - sy) as f64
+            && y <= (*ly + 84.0 + *lh - sy) as f64
         {
             if let Ok(url) = parse_url(href) {
                 navigate(state, url);
@@ -340,6 +352,37 @@ fn delete_selection(state: &mut AppState) {
         }
     }
     state.selection_start = None;
+}
+
+fn handle_scroll_key(state: &mut AppState, key: Key) {
+    let height = state.window_height;
+    let content_height = state.content_height;
+    let visible_height = height - 92.0;
+
+    match key {
+        Key::ArrowDown => {
+            state.scroll_y = (state.scroll_y + 40.0).min((content_height - visible_height).max(0.0));
+        }
+        Key::ArrowUp => {
+            state.scroll_y = (state.scroll_y - 40.0).max(0.0);
+        }
+        Key::PageDown => {
+            state.scroll_y = (state.scroll_y + 400.0).min((content_height - visible_height).max(0.0));
+        }
+        Key::PageUp => {
+            state.scroll_y = (state.scroll_y - 400.0).max(0.0);
+        }
+        Key::Home => {
+            state.scroll_y = 0.0;
+        }
+        Key::End => {
+            state.scroll_y = (content_height - visible_height).max(0.0);
+        }
+        Key::Space => {
+            state.scroll_y = (state.scroll_y + visible_height * 0.5).min((content_height - visible_height).max(0.0));
+        }
+        _ => {}
+    }
 }
 
 fn handle_address_bar_key(state: &mut AppState, key: Key, modifiers: Modifiers) {
@@ -527,10 +570,13 @@ fn find_word_end(s: &str, pos: usize) -> usize {
 }
 
 fn navigate(state: &mut AppState, url: url::Url) {
+    state.scroll_y = 0.0;
+
     if url.as_str() == "about:blank" || url.as_str() == "about:newtab" {
         state.content_display_list.clear();
         state.page_links.clear();
         state.page_title = None;
+        state.content_height = 0.0;
         return;
     }
 
@@ -656,6 +702,15 @@ fn build_display_list(state: &mut AppState) {
         color: Color::from_rgba8(255, 255, 255, 255),
     });
 
+    let content_height = state.content_display_list.commands().iter().fold(0.0f32, |max_y, cmd| {
+        match cmd {
+            DisplayCommand::Rect(rect) => max_y.max(rect.y + rect.height),
+            DisplayCommand::Text(text) => max_y.max(text.y + 20.0),
+            _ => max_y,
+        }
+    }) + 20.0;
+    state.content_height = content_height;
+
     list.push_clip(ClipRect {
         x: 8.0,
         y: content_area_y,
@@ -663,12 +718,14 @@ fn build_display_list(state: &mut AppState) {
         height: content_area_h,
     });
 
+    let sy = state.scroll_y;
+
     for cmd in state.content_display_list.commands() {
         match cmd {
             DisplayCommand::Rect(rect) => {
                 list.push_rect(DrawRect {
                     x: 8.0 + rect.x,
-                    y: content_area_y + rect.y,
+                    y: content_area_y + rect.y - sy,
                     width: rect.width,
                     height: rect.height,
                     color: rect.color,
@@ -681,7 +738,7 @@ fn build_display_list(state: &mut AppState) {
                 }
                 list.push_text(DrawText {
                     x: render_x,
-                    y: content_area_y + text.y,
+                    y: content_area_y + text.y - sy,
                     ..text.clone()
                 });
             }
@@ -690,6 +747,32 @@ fn build_display_list(state: &mut AppState) {
     }
 
     list.pop_clip();
+
+    // Scrollbar
+    if content_height > content_area_h {
+        let scrollbar_width = 8.0;
+        let sb_x = width - 16.0;
+        let scrollable = content_height - content_area_h;
+        let scroll_frac = (state.scroll_y / scrollable).min(1.0);
+        let visible_ratio = (content_area_h / content_height).min(1.0);
+        let thumb_height = (visible_ratio * content_area_h).max(20.0);
+        let thumb_y = content_area_y + scroll_frac * (content_area_h - thumb_height);
+
+        list.push_rect(DrawRect {
+            x: sb_x,
+            y: content_area_y,
+            width: scrollbar_width,
+            height: content_area_h,
+            color: Color::from_rgba8(200, 200, 210, 100),
+        });
+        list.push_rect(DrawRect {
+            x: sb_x,
+            y: thumb_y,
+            width: scrollbar_width,
+            height: thumb_height,
+            color: Color::from_rgba8(120, 120, 130, 150),
+        });
+    }
 }
 
 fn draw_address_bar(
