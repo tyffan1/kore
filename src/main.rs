@@ -33,7 +33,6 @@ struct AppState {
     window_width: f32,
     window_height: f32,
     scroll_y: f32,
-    content_height: f32,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -83,7 +82,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         window_width: 1280.0,
         window_height: 720.0,
         scroll_y: 0.0,
-        content_height: 0.0,
     });
 
     let window = RefCell::new(None::<Arc<winit::window::Window>>);
@@ -355,31 +353,21 @@ fn delete_selection(state: &mut AppState) {
 }
 
 fn handle_scroll_key(state: &mut AppState, key: Key) {
-    let height = state.window_height;
-    let content_height = state.content_height;
-    let visible_height = height - 92.0;
-
     match key {
         Key::ArrowDown => {
-            state.scroll_y = (state.scroll_y + 40.0).min((content_height - visible_height).max(0.0));
+            state.scroll_y += 40.0;
         }
         Key::ArrowUp => {
             state.scroll_y = (state.scroll_y - 40.0).max(0.0);
         }
-        Key::PageDown => {
-            state.scroll_y = (state.scroll_y + 400.0).min((content_height - visible_height).max(0.0));
+        Key::PageDown | Key::Space => {
+            state.scroll_y += 400.0;
         }
         Key::PageUp => {
             state.scroll_y = (state.scroll_y - 400.0).max(0.0);
         }
         Key::Home => {
             state.scroll_y = 0.0;
-        }
-        Key::End => {
-            state.scroll_y = (content_height - visible_height).max(0.0);
-        }
-        Key::Space => {
-            state.scroll_y = (state.scroll_y + visible_height * 0.5).min((content_height - visible_height).max(0.0));
         }
         _ => {}
     }
@@ -576,7 +564,6 @@ fn navigate(state: &mut AppState, url: url::Url) {
         state.content_display_list.clear();
         state.page_links.clear();
         state.page_title = None;
-        state.content_height = 0.0;
         return;
     }
 
@@ -709,7 +696,6 @@ fn build_display_list(state: &mut AppState) {
             _ => max_y,
         }
     }) + 20.0;
-    state.content_height = content_height;
 
     list.push_clip(ClipRect {
         x: 8.0,
@@ -719,13 +705,20 @@ fn build_display_list(state: &mut AppState) {
     });
 
     let sy = state.scroll_y;
+    let visible_top = content_area_y;
+    let visible_bottom = content_area_y + content_area_h;
 
     for cmd in state.content_display_list.commands() {
         match cmd {
             DisplayCommand::Rect(rect) => {
+                let render_y = content_area_y + rect.y - sy;
+                let render_bottom = render_y + rect.height;
+                if render_bottom < visible_top || render_y > visible_bottom {
+                    continue;
+                }
                 list.push_rect(DrawRect {
                     x: 8.0 + rect.x,
-                    y: content_area_y + rect.y - sy,
+                    y: render_y,
                     width: rect.width,
                     height: rect.height,
                     color: rect.color,
@@ -736,9 +729,13 @@ fn build_display_list(state: &mut AppState) {
                 if render_x > width - 20.0 {
                     continue;
                 }
+                let render_y = content_area_y + text.y - sy;
+                if render_y + 20.0 < visible_top || render_y > visible_bottom {
+                    continue;
+                }
                 list.push_text(DrawText {
                     x: render_x,
-                    y: content_area_y + text.y - sy,
+                    y: render_y,
                     ..text.clone()
                 });
             }
