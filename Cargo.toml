@@ -62,6 +62,7 @@ pollster = "0.4"
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 wgpu = { version = "22", default-features = false, features = ["wgsl", "dx12", "metal", "vulkan-portability"] }
 winit = { version = "0.30", default-features = false }
+urlencoding = "2.1"
 url = { workspace = true }
 
 [workspace.dependencies]

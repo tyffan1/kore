@@ -25,7 +25,8 @@ impl WindowHandle {
         let mut winit_attrs = winit::window::Window::default_attributes()
             .with_title(&config.title)
             .with_inner_size(LogicalSize::new(config.width as f64, config.height as f64))
-            .with_resizable(config.resizable);
+            .with_resizable(config.resizable)
+            .with_decorations(false);
 
         if config.fullscreen {
             winit_attrs = winit_attrs

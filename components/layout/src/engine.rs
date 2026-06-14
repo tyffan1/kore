@@ -143,7 +143,7 @@ impl<'a> LayoutBuilder<'a> {
                 inherit_from_parent(&mut style, &self.nodes, parent);
                 let font_size = style.font_size.unwrap_or(16.0);
                 style.width = Some(text_width(text, font_size));
-                style.height = Some(font_size * 1.4);
+                style.height = Some(font_size * 1.5);
                 self.push_node(Some(dom_id), Some(parent), style);
             }
             NodeKind::Document

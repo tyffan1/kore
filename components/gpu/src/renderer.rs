@@ -242,6 +242,14 @@ impl Renderer {
     /// Text commands are rendered as placeholder colored quads positioned
     /// at the correct glyph locations.
     pub fn submit(&self, frame: &mut FrameRenderer, list: &DisplayList) {
+        const MAX_COMMANDS: usize = 100_000;
+        if list.commands().len() > MAX_COMMANDS {
+            eprintln!("Warning: display list has {} commands, > {} max, skipping", list.commands().len(), MAX_COMMANDS);
+            return;
+        }
+
+        eprintln!("submit: {} commands", list.commands().len());
+
         let mut clip_stack: Vec<crate::display_list::ClipRect> = Vec::new();
 
         for cmd in list.commands() {
@@ -280,36 +288,21 @@ impl Renderer {
                             continue;
                         }
                     }
+                    let ch_w = t.font_size * 0.55;
+                    let ch_h = t.font_size;
+                    let rect_w = ch_w * 0.8;
+                    let mut cx = t.x;
                     let color = [t.color.r, t.color.g, t.color.b, t.color.a];
-                    let mut cursor_x = t.x;
-                    let baseline_y = t.y;
-                    let mut cache = self.font_cache.borrow_mut();
-
                     for ch in t.text.chars() {
-                        let bitmap = cache
-                            .rasterize_glyph(self.font_id, ch, t.font_size)
-                            .cloned();
-                        if let Some(g) = bitmap {
-                            let glyph_top = baseline_y - g.y_offset as f32 - g.height as f32;
-                            for py in 0..g.height {
-                                let row_start = py * g.width;
-                                for px in 0..g.width {
-                                    if g.pixels[row_start as usize + px as usize] > 127 {
-                                        let rx = cursor_x + g.x_offset as f32 + px as f32;
-                                        let ry = glyph_top + py as f32;
-                                        let base = frame.rect_vertices.len() as u16;
-                                        let verts = rect_vertices(rx, ry, 1.0, 1.0, color);
-                                        frame.rect_vertices.extend_from_slice(&verts);
-                                        for &i in &RECT_INDICES {
-                                            frame.rect_indices.push(base + i);
-                                        }
-                                    }
-                                }
+                        if ch != ' ' {
+                            let base = frame.rect_vertices.len() as u16;
+                            let verts = rect_vertices(cx, t.y, rect_w, ch_h, color);
+                            frame.rect_vertices.extend_from_slice(&verts);
+                            for &i in &RECT_INDICES {
+                                frame.rect_indices.push(base + i);
                             }
-                            cursor_x += g.advance_width;
-                        } else {
-                            cursor_x += t.font_size * 0.6;
                         }
+                        cx += ch_w;
                     }
                 }
                 DisplayCommand::PushClip(c) => {

@@ -227,6 +227,7 @@ fn key_from_winit(key: &winit::keyboard::PhysicalKey) -> Key {
             KeyCode::ShiftLeft | KeyCode::ShiftRight => Key::Shift,
             KeyCode::AltLeft | KeyCode::AltRight => Key::Alt,
             KeyCode::SuperLeft | KeyCode::SuperRight => Key::Meta,
+            KeyCode::Comma => Key::Comma,
             _ => Key::Unknown(*code as u32),
         },
         winit::keyboard::PhysicalKey::Unidentified(_) => Key::Unknown(0),
@@ -266,6 +267,7 @@ fn is_named_key(key: Key) -> bool {
             | Key::Shift
             | Key::Alt
             | Key::Meta
+            | Key::Comma
     )
 }
 

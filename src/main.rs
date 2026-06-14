@@ -1,17 +1,23 @@
 use std::cell::RefCell;
+use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Instant;
 
 use clipboard::ClipboardProvider;
 use kore_browser::BrowserApp;
 use kore_gpu::{ClipRect, Color, DisplayCommand, DisplayList, DrawRect, DrawText, Renderer, RendererConfig};
-use kore_pipeline::Pipeline;
+use kore_pipeline::{Pipeline, RenderOutput};
 use kore_window::{AppEvent, EventLoop, InputEvent, Key, Modifiers, MouseButton, WindowBuilder, WindowHandle};
+
+const SEARCH_ENGINES: &[(&str, &str)] = &[
+    ("Brave", "https://search.brave.com/search?q="),
+    ("DuckDuckGo", "https://html.duckduckgo.com/html/?q="),
+    ("Bing", "https://www.bing.com/search?q="),
+];
 
 struct AppState {
     browser: BrowserApp,
-    pipeline: Pipeline,
-    rt: tokio::runtime::Runtime,
+    pipeline: Arc<Pipeline>,
     display_list: DisplayList,
     content_display_list: DisplayList,
     page_links: Vec<(f32, f32, f32, f32, String)>,
@@ -33,6 +39,13 @@ struct AppState {
     window_width: f32,
     window_height: f32,
     scroll_y: f32,
+    window: Option<Arc<winit::window::Window>>,
+    close_btn_hover: bool,
+    max_btn_hover: bool,
+    min_btn_hover: bool,
+    search_engine_index: usize,
+    render_tx: mpsc::SyncSender<RenderOutput>,
+    render_rx: mpsc::Receiver<RenderOutput>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -40,6 +53,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .args(["/c", "chcp 65001"])
         .output();
     let session_path = std::env::temp_dir().join("kore_session.json");
+    let _ = std::fs::remove_file(&session_path);
     let mut browser = BrowserApp::new(session_path);
     browser.init()?;
 
@@ -56,11 +70,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
     let el = EventLoop::new()?;
 
-    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (tx, rx) = mpsc::sync_channel::<RenderOutput>(4);
     let state = RefCell::new(AppState {
         browser,
-        pipeline: Pipeline::default(),
-        rt,
+        pipeline: Arc::new(Pipeline::default()),
         display_list: DisplayList::new(),
         content_display_list: DisplayList::new(),
         page_links: Vec::new(),
@@ -82,9 +95,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         window_width: 1280.0,
         window_height: 720.0,
         scroll_y: 0.0,
+        window: None,
+        close_btn_hover: false,
+        max_btn_hover: false,
+        min_btn_hover: false,
+        search_engine_index: 0,
+        render_tx: tx,
+        render_rx: rx,
     });
 
-    let window = RefCell::new(None::<Arc<winit::window::Window>>);
     let renderer = RefCell::new(None::<Renderer>);
 
     el.run(move |event, elwt| {
@@ -106,7 +125,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             )) {
                                 Ok(r) => {
                                     w.request_redraw();
-                                    *window.borrow_mut() = Some(w);
+                                    state.borrow_mut().window = Some(w.clone());
                                     *renderer.borrow_mut() = Some(r);
                                 }
                                 Err(e) => {
@@ -123,17 +142,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 {
                     let mut s = state.borrow_mut();
+                    if let Ok(output) = s.render_rx.try_recv() {
+                        s.content_display_list = output.display_list;
+                        s.page_title = output.title;
+                        s.page_links = output.links;
+                        s.loading = false;
+                        if let Some(ref w) = s.window {
+                            w.request_redraw();
+                        }
+                    }
                     build_display_list(&mut s);
                 }
 
-                if let Some(ref w) = *window.borrow() {
+                {
                     let s = state.borrow();
                     let title = s
                         .page_title
                         .as_deref()
                         .map(|t| format!("{t} - Kore"))
                         .unwrap_or_else(|| "Kore".to_string());
-                    w.set_title(&title);
+                    if let Some(ref w) = s.window {
+                        w.set_title(&title);
+                    }
                 }
 
                 if let Some(r) = renderer.borrow_mut().as_mut() {
@@ -144,7 +174,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             if let Err(e) = r.end_frame(frame) {
                                 eprintln!("Render error: {e}");
                             }
-                            if let Some(ref w) = *window.borrow() {
+                            if let Some(ref w) = state.borrow().window {
                                 w.request_redraw();
                             }
                         }
@@ -227,6 +257,7 @@ fn handle_input(state: &mut AppState, event: InputEvent) {
         InputEvent::MouseMoved { x, y } => {
             state.mouse_x = x;
             state.mouse_y = y;
+            update_hover_states(state);
         }
 
         InputEvent::MouseClicked { button: MouseButton::Left, .. } => {
@@ -242,21 +273,121 @@ fn handle_input(state: &mut AppState, event: InputEvent) {
     }
 }
 
+fn update_hover_states(state: &mut AppState) {
+    let x = state.mouse_x;
+    let y = state.mouse_y;
+    let w = state.window_width as f64;
+
+    state.back_button_hover = x >= 8.0 && x <= 36.0 && y >= 36.0 && y <= 72.0;
+    state.forward_button_hover = x >= 42.0 && x <= 70.0 && y >= 36.0 && y <= 72.0;
+    state.reload_button_hover = x >= 76.0 && x <= 104.0 && y >= 36.0 && y <= 72.0;
+
+    // Window control button hover (titlebar, y < 36)
+    state.min_btn_hover = y < 36.0 && x >= w - 108.0 && x <= w - 72.0;
+    state.max_btn_hover = y < 36.0 && x >= w - 72.0 && x <= w - 36.0;
+    state.close_btn_hover = y < 36.0 && x >= w - 36.0 && x <= w;
+}
+
 fn handle_mouse_click(state: &mut AppState, x: f64, y: f64) {
-    const ADDRESS_BAR_X: f64 = 10.0;
-    const ADDRESS_BAR_Y: f64 = 44.0;
-    const ADDRESS_BAR_WIDTH: f64 = 1280.0 - 20.0;
-    const ADDRESS_BAR_HEIGHT: f64 = 32.0;
+    let w = state.window_width as f64;
+
+    // ── Row 1: Titlebar + Tab bar (y < 36) ──
+    if y < 36.0 {
+        // Window control buttons (right side)
+        if x >= w - 36.0 && x <= w {
+            // Close
+            let _ = state.browser.shutdown();
+            std::process::exit(0);
+        }
+        if x >= w - 72.0 && x <= w - 36.0 {
+            // Maximize / Restore toggle
+            if let Some(ref win) = state.window {
+                let is_max = win.is_maximized();
+                win.set_maximized(!is_max);
+            }
+            return;
+        }
+        if x >= w - 108.0 && x <= w - 72.0 {
+            // Minimize
+            if let Some(ref win) = state.window {
+                win.set_minimized(true);
+            }
+            return;
+        }
+
+        let tab_start_x = 32.0;
+        let tabs = state.browser.list_tabs().to_vec();
+
+        // Tab clicks
+        for (i, tab) in tabs.iter().enumerate() {
+            let tx = (tab_start_x + (i as f32) * 180.0) as f64;
+            // Close button on tab
+            if x >= tx + 148.0 && x <= tx + 168.0 && y >= 0.0 && y <= 36.0 {
+                let id = tab.id;
+                let _ = state.browser.close_tab(id);
+                if state.browser.tab_count() == 0 {
+                    if let Ok(url) = url::Url::parse("about:blank") {
+                        let _ = state.browser.open_tab(url);
+                    }
+                }
+                reset_content_state(state);
+                if let Some(active) = state.browser.tab_manager.active_tab() {
+                    navigate(state, active.url.clone());
+                }
+                return;
+            }
+            // Tab body
+            if x >= tx && x <= tx + 170.0 && y >= 0.0 && y <= 36.0 {
+                let _ = state.browser.switch_tab(tab.id);
+                reset_content_state(state);
+                if let Some(active) = state.browser.tab_manager.active_tab() {
+                    navigate(state, active.url.clone());
+                }
+                return;
+            }
+        }
+
+        // New tab button (before window controls)
+        let new_tab_x = ((tab_start_x + (tabs.len() as f32) * 180.0) as f64).min(w - 144.0);
+        if x >= new_tab_x && x <= new_tab_x + 36.0 && y >= 0.0 && y <= 36.0 {
+            if let Ok(url) = url::Url::parse("about:blank") {
+                if state.browser.open_tab(url).is_ok() {
+                    if let Some(tab) = state.browser.tab_manager.active_tab() {
+                        let _ = state.browser.switch_tab(tab.id);
+                    }
+                    reset_content_state(state);
+                }
+            }
+            return;
+        }
+
+        // Click on titlebar empty area → window drag
+        if let Some(ref win) = state.window {
+            let _ = win.drag_window();
+        }
+        return;
+    }
+
+    // ── Row 2: Navigation bar (y >= 36, y < 72) ──
+    const ADDRESS_BAR_X: f64 = 110.0;
+    const ADDRESS_BAR_Y: f64 = 36.0;
+    const ADDRESS_BAR_WIDTH: f64 = 1280.0 - 120.0;
+    const ADDRESS_BAR_HEIGHT: f64 = 36.0;
 
     const BACK_BTN_X: f64 = 8.0;
-    const BACK_BTN_Y: f64 = 4.0;
-    const BTN_SIZE: f64 = 28.0;
+    const BACK_BTN_Y: f64 = 36.0;
+    const BACK_BTN_W: f64 = 28.0;
+    const BACK_BTN_H: f64 = 36.0;
 
-    const FORWARD_BTN_X: f64 = 44.0;
-    const FORWARD_BTN_Y: f64 = 4.0;
+    const FORWARD_BTN_X: f64 = 42.0;
+    const FORWARD_BTN_Y: f64 = 36.0;
+    const FORWARD_BTN_W: f64 = 28.0;
+    const FORWARD_BTN_H: f64 = 36.0;
 
-    const RELOAD_BTN_X: f64 = 80.0;
-    const RELOAD_BTN_Y: f64 = 4.0;
+    const RELOAD_BTN_X: f64 = 76.0;
+    const RELOAD_BTN_Y: f64 = 36.0;
+    const RELOAD_BTN_W: f64 = 28.0;
+    const RELOAD_BTN_H: f64 = 36.0;
 
     let in_address_bar = x >= ADDRESS_BAR_X
         && x <= ADDRESS_BAR_X + ADDRESS_BAR_WIDTH
@@ -264,19 +395,19 @@ fn handle_mouse_click(state: &mut AppState, x: f64, y: f64) {
         && y <= ADDRESS_BAR_Y + ADDRESS_BAR_HEIGHT;
 
     let in_back_btn = x >= BACK_BTN_X
-        && x <= BACK_BTN_X + BTN_SIZE
+        && x <= BACK_BTN_X + BACK_BTN_W
         && y >= BACK_BTN_Y
-        && y <= BACK_BTN_Y + BTN_SIZE;
+        && y <= BACK_BTN_Y + BACK_BTN_H;
 
     let in_forward_btn = x >= FORWARD_BTN_X
-        && x <= FORWARD_BTN_X + BTN_SIZE
+        && x <= FORWARD_BTN_X + FORWARD_BTN_W
         && y >= FORWARD_BTN_Y
-        && y <= FORWARD_BTN_Y + BTN_SIZE;
+        && y <= FORWARD_BTN_Y + FORWARD_BTN_H;
 
     let in_reload_btn = x >= RELOAD_BTN_X
-        && x <= RELOAD_BTN_X + BTN_SIZE
+        && x <= RELOAD_BTN_X + RELOAD_BTN_W
         && y >= RELOAD_BTN_Y
-        && y <= RELOAD_BTN_Y + BTN_SIZE;
+        && y <= RELOAD_BTN_Y + RELOAD_BTN_H;
 
     if in_address_bar {
         state.address_bar_focused = true;
@@ -302,21 +433,23 @@ fn handle_mouse_click(state: &mut AppState, x: f64, y: f64) {
         }
     } else if in_reload_btn {
         if let Some(active) = state.browser.tab_manager.active_tab() {
+            state.loading = true;
+            state.content_display_list.clear();
             let url = active.url.clone();
             navigate(state, url);
         }
         return;
     }
 
-    // Check page links
+    // Check page links (content area)
     let sy = state.scroll_y;
     for (lx, ly, lw, lh, href) in &state.page_links {
         if x >= *lx as f64
             && x <= (*lx + *lw) as f64
-            && y >= (*ly + 84.0 - sy) as f64
-            && y <= (*ly + 84.0 + *lh - sy) as f64
+            && y >= (*ly + 72.0 - sy) as f64
+            && y <= (*ly + 72.0 + *lh - sy) as f64
         {
-            if let Ok(url) = parse_url(href) {
+            if let Ok(url) = parse_url(href, state.search_engine_index) {
                 navigate(state, url);
             }
             break;
@@ -381,7 +514,7 @@ fn handle_address_bar_key(state: &mut AppState, key: Key, modifiers: Modifiers) 
         Key::Enter => {
             let url_str = state.url_buffer.trim();
             if !url_str.is_empty() {
-                let url = parse_url(url_str);
+                let url = parse_url(url_str, state.search_engine_index);
                 if let Ok(url) = url {
                     if let Some(tab) = state.browser.tab_manager.active_tab_mut() {
                         tab.navigate(url.clone());
@@ -486,7 +619,12 @@ fn handle_global_shortcuts(state: &mut AppState, key: Key, modifiers: Modifiers)
         }
         Key::T => {
             let Ok(url) = url::Url::parse("about:blank") else { return };
-            let _ = state.browser.open_tab(url);
+            if state.browser.open_tab(url).is_ok() {
+                if let Some(tab) = state.browser.tab_manager.active_tab() {
+                    let _ = state.browser.switch_tab(tab.id);
+                }
+                reset_content_state(state);
+            }
         }
         Key::W => {
             if let Some(active) = state.browser.tab_manager.active_tab() {
@@ -497,6 +635,10 @@ fn handle_global_shortcuts(state: &mut AppState, key: Key, modifiers: Modifiers)
                 let Ok(url) = url::Url::parse("about:blank") else { return };
                 let _ = state.browser.open_tab(url);
             }
+            reset_content_state(state);
+            if let Some(tab) = state.browser.tab_manager.active_tab() {
+                navigate(state, tab.url.clone());
+            }
         }
         Key::L => {
             state.address_bar_focused = true;
@@ -505,6 +647,13 @@ fn handle_global_shortcuts(state: &mut AppState, key: Key, modifiers: Modifiers)
                 state.cursor_pos = state.url_buffer.chars().count();
                 state.selection_start = Some(0);
             }
+        }
+        Key::Comma => {
+            state.search_engine_index = (state.search_engine_index + 1) % SEARCH_ENGINES.len();
+            state.address_bar_focused = true;
+            state.url_buffer = format!("Search engine: {}", SEARCH_ENGINES[state.search_engine_index].0);
+            state.cursor_pos = state.url_buffer.chars().count();
+            state.selection_start = Some(0);
         }
         Key::R => {
             if let Some(active) = state.browser.tab_manager.active_tab() {
@@ -530,12 +679,33 @@ fn handle_global_shortcuts(state: &mut AppState, key: Key, modifiers: Modifiers)
     }
 }
 
-fn parse_url(input: &str) -> Result<url::Url, url::ParseError> {
-    if input.starts_with("http://") || input.starts_with("https://") || input.starts_with("about:") {
-        url::Url::parse(input)
-    } else {
-        url::Url::parse(&format!("https://{input}"))
+fn parse_url(input: &str, search_engine_index: usize) -> Result<url::Url, url::ParseError> {
+    let trimmed = input.trim();
+
+    if trimmed.starts_with('/') {
+        return url::Url::parse(&format!("https://localhost{trimmed}"));
     }
+
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://")
+       || trimmed.starts_with("about:") {
+        return url::Url::parse(trimmed);
+    }
+
+    if !trimmed.contains(' ') && trimmed.contains('.') {
+        return url::Url::parse(&format!("https://{trimmed}"));
+    }
+
+    let search_url = SEARCH_ENGINES[search_engine_index % SEARCH_ENGINES.len()].1;
+    let query = urlencoding::encode(trimmed);
+    url::Url::parse(&format!("{search_url}{query}"))
+}
+
+fn reset_content_state(state: &mut AppState) {
+    state.content_display_list.clear();
+    state.page_title = None;
+    state.scroll_y = 0.0;
+    state.url_buffer = String::new();
+    state.page_links.clear();
 }
 
 fn find_word_start(s: &str, pos: usize) -> usize {
@@ -557,8 +727,24 @@ fn find_word_end(s: &str, pos: usize) -> usize {
     p
 }
 
-fn navigate(state: &mut AppState, url: url::Url) {
+fn navigate(state: &mut AppState, mut url: url::Url) {
     state.scroll_y = 0.0;
+
+    // Resolve relative URLs against current page origin
+    let url_str = url.as_str().to_string();
+    if url_str.starts_with('/') {
+        if let Some(active) = state.browser.tab_manager.active_tab() {
+            if let Ok(base) = url::Url::parse(&format!(
+                "{}://{}",
+                active.url.scheme(),
+                active.url.host_str().unwrap_or("localhost")
+            )) {
+                if let Ok(resolved) = base.join(&url_str) {
+                    url = resolved;
+                }
+            }
+        }
+    }
 
     if url.as_str() == "about:blank" || url.as_str() == "about:newtab" {
         state.content_display_list.clear();
@@ -568,75 +754,97 @@ fn navigate(state: &mut AppState, url: url::Url) {
     }
 
     state.loading = true;
+    state.content_display_list.clear();
 
-    let render_output = match state.rt.block_on(state.pipeline.render(&url)) {
-        Ok(output) => output,
-        Err(e) => {
-            eprintln!("Render pipeline error: {e}");
-            state.loading = false;
-            return;
+    let tx = state.render_tx.clone();
+    let pipeline = Arc::clone(&state.pipeline);
+    let url = url.clone();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to build runtime");
+        if let Ok(output) = rt.block_on(pipeline.render(&url)) {
+            let _ = tx.send(output);
         }
-    };
+    });
+}
 
-    state.content_display_list = render_output.display_list;
-    state.page_links = render_output.links;
-    state.page_title = render_output.title;
-    state.loading = false;
+fn draw_titlebar(list: &mut DisplayList, tabs: &[kore_browser::Tab], page_title: Option<&str>, w: f32, min_hov: bool, max_hov: bool, close_hov: bool) {
+    let tab_start = 32.0;
+    list.push_rect(DrawRect { x: 0.0, y: 0.0, width: w, height: 36.0, color: Color::from_rgba8(30, 30, 42, 255) });
+    list.push_rect(DrawRect { x: 8.0, y: 10.0, width: 16.0, height: 16.0, color: Color::from_rgba8(100, 100, 110, 255) });
+
+    for (i, tab) in tabs.iter().enumerate() {
+        let tx = tab_start + (i as f32) * 180.0;
+        let tab_color = if tab.is_active { Color::from_rgba8(45, 45, 58, 255) } else { Color::from_rgba8(30, 30, 42, 255) };
+        list.push_rect(DrawRect { x: tx, y: 0.0, width: 170.0, height: 36.0, color: tab_color });
+        let title: String = if tab.is_active && page_title.is_some() {
+            page_title.unwrap().chars().take(20).collect()
+        } else if tab.url.as_str() == "about:blank" { "New Tab".to_string() } else { tab.url.as_str().chars().take(20).collect() };
+        list.push_text(DrawText { x: tx + 8.0, y: 11.0, text: title, font_size: 13.0, color: Color::WHITE, font_family: Some("sans-serif".to_string()), bold: false, italic: false });
+        list.push_text(DrawText { x: tx + 150.0, y: 11.0, text: "×".to_string(), font_size: 13.0, color: Color::from_rgba8(180, 180, 190, 255), font_family: Some("sans-serif".to_string()), bold: false, italic: false });
+    }
+
+    let new_tab_x = (tab_start + (tabs.len() as f32) * 180.0).min(w - 144.0);
+    list.push_rect(DrawRect { x: new_tab_x, y: 0.0, width: 36.0, height: 36.0, color: Color::from_rgba8(30, 30, 42, 255) });
+    list.push_text(DrawText { x: new_tab_x + 11.0, y: 11.0, text: "+".to_string(), font_size: 14.0, color: Color::WHITE, font_family: Some("sans-serif".to_string()), bold: false, italic: false });
+
+    let min_bg = if min_hov { Color::from_rgba8(55, 55, 70, 255) } else { Color::from_rgba8(30, 30, 42, 255) };
+    list.push_rect(DrawRect { x: w - 108.0, y: 0.0, width: 36.0, height: 36.0, color: min_bg });
+    list.push_text(DrawText { x: w - 96.0, y: 11.0, text: "\u{2212}".to_string(), font_size: 14.0, color: Color::WHITE, font_family: Some("sans-serif".to_string()), bold: false, italic: false });
+
+    let max_bg = if max_hov { Color::from_rgba8(55, 55, 70, 255) } else { Color::from_rgba8(30, 30, 42, 255) };
+    list.push_rect(DrawRect { x: w - 72.0, y: 0.0, width: 36.0, height: 36.0, color: max_bg });
+    list.push_text(DrawText { x: w - 60.0, y: 11.0, text: "\u{25A1}".to_string(), font_size: 14.0, color: Color::WHITE, font_family: Some("sans-serif".to_string()), bold: false, italic: false });
+
+    let close_bg = if close_hov { Color::from_rgba8(0xE8, 0x11, 0x23, 255) } else { Color::from_rgba8(30, 30, 42, 255) };
+    list.push_rect(DrawRect { x: w - 36.0, y: 0.0, width: 36.0, height: 36.0, color: close_bg });
+    list.push_text(DrawText { x: w - 24.0, y: 11.0, text: "\u{00D7}".to_string(), font_size: 14.0, color: Color::WHITE, font_family: Some("sans-serif".to_string()), bold: false, italic: false });
+}
+
+fn draw_navbar(list: &mut DisplayList, w: f32, back_hov: bool, fwd_hov: bool, rld_hov: bool, loading: bool, url_text: String, is_secure: bool, cursor_pos: usize, selection_start: Option<usize>, cursor_visible: bool, address_bar_focused: bool) {
+    list.push_rect(DrawRect { x: 0.0, y: 36.0, width: w, height: 36.0, color: Color::from_rgba8(40, 40, 58, 255) });
+
+    let back_bg = if back_hov { Color::from_rgba8(74, 74, 79, 255) } else { Color::from_rgba8(58, 58, 63, 255) };
+    list.push_rect(DrawRect { x: 8.0, y: 40.0, width: 28.0, height: 28.0, color: back_bg });
+    list.push_text(DrawText { x: 14.0, y: 48.0, text: "<".to_string(), font_size: 14.0, color: Color::WHITE, font_family: Some("sans-serif".to_string()), bold: false, italic: false });
+
+    let fwd_bg = if fwd_hov { Color::from_rgba8(74, 74, 79, 255) } else { Color::from_rgba8(58, 58, 63, 255) };
+    list.push_rect(DrawRect { x: 42.0, y: 40.0, width: 28.0, height: 28.0, color: fwd_bg });
+    list.push_text(DrawText { x: 48.0, y: 48.0, text: ">".to_string(), font_size: 14.0, color: Color::WHITE, font_family: Some("sans-serif".to_string()), bold: false, italic: false });
+
+    let rld_bg = if rld_hov { Color::from_rgba8(74, 74, 79, 255) } else { Color::from_rgba8(58, 58, 63, 255) };
+    list.push_rect(DrawRect { x: 76.0, y: 40.0, width: 28.0, height: 28.0, color: rld_bg });
+    list.push_text(DrawText { x: 80.0, y: 48.0, text: "R".to_string(), font_size: 14.0, color: Color::WHITE, font_family: Some("sans-serif".to_string()), bold: false, italic: false });
+
+    list.push_rect(DrawRect { x: 110.0, y: 40.0, width: w - 120.0, height: 28.0, color: Color::from_rgba8(245, 245, 245, 255) });
+    draw_address_bar(list, url_text, is_secure, address_bar_focused, cursor_pos, selection_start, cursor_visible);
+
+    if loading {
+        list.push_rect(DrawRect { x: 110.0, y: 69.0, width: w - 120.0, height: 3.0, color: Color::from_rgba8(66, 133, 244, 255) });
+    }
 }
 
 fn build_display_list(state: &mut AppState) {
     let width = state.window_width;
     let height = state.window_height;
 
-    let list = &mut state.display_list;
-    list.clear();
+    let tabs: Vec<kore_browser::Tab> = state.browser.list_tabs().to_vec();
+    let page_title = state.page_title.as_deref();
+    let back_hov = state.back_button_hover;
+    let fwd_hov = state.forward_button_hover;
+    let rld_hov = state.reload_button_hover;
+    let close_hov = state.close_btn_hover;
+    let max_hov = state.max_btn_hover;
+    let min_hov = state.min_btn_hover;
+    let loading = state.loading;
 
-    list.push_rect(DrawRect {
-        x: 0.0,
-        y: 0.0,
-        width,
-        height,
-        color: Color::from_rgba8(240, 240, 245, 255),
-    });
-
-    list.push_rect(DrawRect {
-        x: 0.0,
-        y: 0.0,
-        width,
-        height: 36.0,
-        color: Color::from_rgba8(30, 30, 35, 255),
-    });
-
-    let tabs = state.browser.list_tabs().to_vec();
-    for (i, tab) in tabs.iter().enumerate() {
-        let tx = 8.0 + (i as f32) * 180.0;
-        let tab_color = if tab.is_active {
-            Color::from_rgba8(50, 50, 55, 255)
-        } else {
-            Color::from_rgba8(40, 40, 45, 255)
-        };
-        list.push_rect(DrawRect {
-            x: tx,
-            y: 4.0,
-            width: 170.0,
-            height: 28.0,
-            color: tab_color,
-        });
-    }
-
-    list.push_rect(DrawRect {
-        x: 8.0,
-        y: 42.0,
-        width: width - 16.0,
-        height: 36.0,
-        color: Color::from_rgba8(200, 200, 210, 255),
-    });
-
-    let url_bg = Color::from_rgba8(245, 245, 245, 255);
     let url_text = if state.address_bar_focused {
         state.url_buffer.clone()
     } else if let Some(active) = state.browser.tab_manager.active_tab() {
-        active.url.as_str().to_string()
+        let url_str = active.url.as_str();
+        if url_str == "about:blank" { String::new() } else { url_str.to_string() }
     } else {
         String::new()
     };
@@ -649,125 +857,80 @@ fn build_display_list(state: &mut AppState) {
     let address_bar_focused = state.address_bar_focused;
 
     let list = &mut state.display_list;
-    list.push_rect(DrawRect {
-        x: 10.0,
-        y: 46.0,
-        width: width - 20.0,
-        height: 28.0,
-        color: url_bg,
-    });
+    list.clear();
 
-    draw_address_bar(
-        list,
-        url_text,
-        is_secure,
-        address_bar_focused,
-        cursor_pos,
-        selection_start,
-        cursor_visible,
-    );
+    list.push_rect(DrawRect { x: 0.0, y: 0.0, width, height, color: Color::from_rgba8(240, 240, 245, 255) });
 
-    // Loading indicator: a thin colored bar at the bottom of the address bar
-    if state.loading {
-        list.push_rect(DrawRect {
-            x: 10.0,
-            y: 76.0,
-            width: width - 20.0,
-            height: 3.0,
-            color: Color::from_rgba8(66, 133, 244, 255),
-        });
-    }
+    // Row 1 - Titlebar + Tabs (y=0..36)
+    draw_titlebar(list, &tabs, page_title, width, min_hov, max_hov, close_hov);
 
-    let content_area_y = 84.0;
-    let content_area_h = height - 92.0;
+    // Row 2 - Navigation + Address bar (y=36..72)
+    draw_navbar(list, width, back_hov, fwd_hov, rld_hov, loading, url_text.clone(), is_secure, cursor_pos, selection_start, cursor_visible, address_bar_focused);
+
+    // Content area (y=72..height)
+    let content_area_y = 72.0;
+    let content_area_h = height - 80.0;
 
     list.push_rect(DrawRect {
-        x: 8.0,
-        y: content_area_y,
-        width: width - 16.0,
-        height: content_area_h,
+        x: 16.0, y: content_area_y, width: width - 32.0, height: content_area_h,
         color: Color::from_rgba8(255, 255, 255, 255),
     });
 
     let content_height = state.content_display_list.commands().iter().fold(0.0f32, |max_y, cmd| {
         match cmd {
             DisplayCommand::Rect(rect) => max_y.max(rect.y + rect.height),
-            DisplayCommand::Text(text) => max_y.max(text.y + 20.0),
+            DisplayCommand::Text(text) => max_y.max(text.y + text.font_size * 1.5),
             _ => max_y,
         }
     }) + 20.0;
 
-    list.push_clip(ClipRect {
-        x: 8.0,
-        y: content_area_y,
-        width: width - 16.0,
-        height: content_area_h,
-    });
+    list.push_clip(ClipRect { x: 16.0, y: content_area_y, width: width - 32.0, height: content_area_h });
 
     let sy = state.scroll_y;
-    let visible_top = content_area_y;
-    let visible_bottom = content_area_y + content_area_h;
-
     for cmd in state.content_display_list.commands() {
         match cmd {
             DisplayCommand::Rect(rect) => {
                 let render_y = content_area_y + rect.y - sy;
-                let render_bottom = render_y + rect.height;
-                if render_bottom < visible_top || render_y > visible_bottom {
-                    continue;
-                }
-                list.push_rect(DrawRect {
-                    x: 8.0 + rect.x,
-                    y: render_y,
-                    width: rect.width,
-                    height: rect.height,
-                    color: rect.color,
-                });
+                if render_y + rect.height < content_area_y || render_y > height { continue; }
+                list.push_rect(DrawRect { x: 16.0 + rect.x, y: render_y, width: rect.width, height: rect.height, color: rect.color });
             }
             DisplayCommand::Text(text) => {
-                let render_x = 8.0 + text.x;
-                if render_x > width - 20.0 {
-                    continue;
-                }
+                let render_x = 16.0 + text.x;
+                if render_x > width - 20.0 { continue; }
                 let render_y = content_area_y + text.y - sy;
-                if render_y + 20.0 < visible_top || render_y > visible_bottom {
-                    continue;
-                }
-                list.push_text(DrawText {
-                    x: render_x,
-                    y: render_y,
-                    ..text.clone()
-                });
+                let text_height = text.font_size * 1.5;
+                if render_y + text_height < content_area_y || render_y > height { continue; }
+                list.push_text(DrawText { x: render_x, y: render_y, ..text.clone() });
             }
             _ => {}
         }
     }
-
     list.pop_clip();
+
+    // Mask header (y=0..72) to cover any content overflow, then redraw UI
+    list.push_rect(DrawRect { x: 0.0, y: 0.0, width, height: 72.0, color: Color::from_rgba8(240, 240, 245, 255) });
+    draw_titlebar(list, &tabs, page_title, width, min_hov, max_hov, close_hov);
+    draw_navbar(list, width, back_hov, fwd_hov, rld_hov, loading, url_text, is_secure, cursor_pos, selection_start, cursor_visible, address_bar_focused);
 
     // Scrollbar
     if content_height > content_area_h {
         let scrollbar_width = 8.0;
-        let sb_x = width - 16.0;
+        let sb_x = width - 24.0;
         let scrollable = content_height - content_area_h;
         let scroll_frac = (state.scroll_y / scrollable).min(1.0);
         let visible_ratio = (content_area_h / content_height).min(1.0);
         let thumb_height = (visible_ratio * content_area_h).max(20.0);
         let thumb_y = content_area_y + scroll_frac * (content_area_h - thumb_height);
+        list.push_rect(DrawRect { x: sb_x, y: content_area_y, width: scrollbar_width, height: content_area_h, color: Color::from_rgba8(200, 200, 210, 100) });
+        list.push_rect(DrawRect { x: sb_x, y: thumb_y, width: scrollbar_width, height: thumb_height, color: Color::from_rgba8(120, 120, 130, 150) });
+    }
 
-        list.push_rect(DrawRect {
-            x: sb_x,
-            y: content_area_y,
-            width: scrollbar_width,
-            height: content_area_h,
-            color: Color::from_rgba8(200, 200, 210, 100),
-        });
-        list.push_rect(DrawRect {
-            x: sb_x,
-            y: thumb_y,
-            width: scrollbar_width,
-            height: thumb_height,
-            color: Color::from_rgba8(120, 120, 130, 150),
+    if address_bar_focused {
+        let label = format!("Search: {}", SEARCH_ENGINES[state.search_engine_index].0);
+        list.push_text(DrawText {
+            x: 10.0, y: height - 20.0, text: label, font_size: 12.0,
+            color: Color::from_rgba8(150, 150, 150, 255),
+            font_family: Some("sans-serif".to_string()), bold: false, italic: false,
         });
     }
 }
@@ -782,33 +945,38 @@ fn draw_address_bar(
     cursor_visible: bool,
 ) {
     let font_size = 14.0;
-    let text_x = 40.0;
-    let text_y = 53.0;
+    let text_x = 126.0;
+    let text_y = 48.0;
 
-    let (security_char, security_color) = if is_secure {
-        ("S", Color::from_rgba8(0, 150, 0, 255))
+    // Security indicator: colored dot
+    let (dot_color, dot_border) = if is_secure {
+        (Color::from_rgba8(0, 180, 0, 255), Color::from_rgba8(0, 130, 0, 255))
     } else {
-        ("!", Color::from_rgba8(200, 100, 0, 255))
+        (Color::from_rgba8(200, 80, 60, 255), Color::from_rgba8(180, 60, 40, 255))
     };
-    list.push_text(DrawText {
-        x: 14.0,
-        y: text_y,
-        text: security_char.to_string(),
-        font_size,
-        color: security_color,
-        font_family: Some("sans-serif".to_string()),
-        bold: true,
-        italic: false,
-    });
+    list.push_rect(DrawRect { x: 116.0, y: 50.0, width: 10.0, height: 10.0, color: dot_border });
+    list.push_rect(DrawRect { x: 118.0, y: 52.0, width: 6.0, height: 6.0, color: dot_color });
+
+    let is_empty = url_text.is_empty();
+    let display_text = if is_empty && !focused {
+        "Search or enter address".to_string()
+    } else {
+        url_text
+    };
+    let text_color = if is_empty && !focused {
+        Color::from_rgba8(150, 150, 150, 255)
+    } else {
+        Color::BLACK
+    };
 
     let mut char_x = text_x;
-    for ch in url_text.chars() {
+    for ch in display_text.chars() {
         list.push_text(DrawText {
             x: char_x,
             y: text_y,
             text: ch.to_string(),
             font_size,
-            color: Color::BLACK,
+            color: text_color,
             font_family: Some("sans-serif".to_string()),
             bold: false,
             italic: false,

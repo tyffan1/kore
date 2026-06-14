@@ -1,7 +1,7 @@
 use kore_css::{parse_stylesheet, CssColor};
 use kore_gpu::{Color, DisplayList, DrawRect, DrawText};
 use kore_html::{parse_document, NodeKind};
-use kore_layout::{layout_document, FontStyle, FontWeight, LayoutConfig, LayoutTree};
+use kore_layout::{layout_document, Display, FontStyle, FontWeight, LayoutConfig, LayoutTree};
 use kore_net::{FetchRequest, HttpClient};
 use url::Url;
 
@@ -18,7 +18,7 @@ head, script, style, link, meta, title {
 }
 body {
     margin: 8px;
-    font-size: 16px;
+    font-size: 15px;
     color: black;
 }
 p { margin: 16px 0; }
@@ -216,6 +216,8 @@ pub fn extract_links(
 /// Build a DisplayList from a LayoutTree and its associated DOM.
 pub fn build_display_list(document: &kore_html::Document, layout_tree: &LayoutTree) -> DisplayList {
     let mut dl = DisplayList::new();
+    let mut inline_cursor_x: Option<f32> = None;
+    let mut inline_cursor_y: Option<f32> = None;
 
     for node in &layout_tree.nodes {
         if node.rect.width <= 0.0 || node.rect.height <= 0.0 {
@@ -260,9 +262,25 @@ pub fn build_display_list(document: &kore_html::Document, layout_tree: &LayoutTr
                             let font_size = node.style.font_size.unwrap_or(16.0);
                             let bold = node.style.font_weight == FontWeight::Bold;
                             let italic = node.style.font_style == FontStyle::Italic;
+                            let is_inline = node.style.display == Display::Inline;
+
+                            let render_x = if is_inline {
+                                if let (Some(cx), Some(cy)) = (inline_cursor_x, inline_cursor_y) {
+                                    if (content_rect.y - cy).abs() < 1.0 {
+                                        cx
+                                    } else {
+                                        inline_cursor_x = None;
+                                        content_rect.x
+                                    }
+                                } else {
+                                    content_rect.x
+                                }
+                            } else {
+                                content_rect.x
+                            };
 
                             dl.push_text(DrawText {
-                                x: content_rect.x,
+                                x: render_x,
                                 y: content_rect.y,
                                 text: trimmed.to_string(),
                                 font_size,
@@ -271,6 +289,12 @@ pub fn build_display_list(document: &kore_html::Document, layout_tree: &LayoutTr
                                 bold,
                                 italic,
                             });
+
+                            if is_inline {
+                                let text_width = trimmed.chars().count() as f32 * font_size * 0.6;
+                                inline_cursor_x = Some(render_x + text_width);
+                                inline_cursor_y = Some(content_rect.y);
+                            }
                         }
                     }
                     NodeKind::Element(el) if el.tag_name.eq_ignore_ascii_case("img") => {
