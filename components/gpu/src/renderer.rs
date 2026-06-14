@@ -6,7 +6,7 @@ use crate::{
     display_list::{DisplayCommand, DisplayList},
     error::GpuError,
     pipeline::{RectPipeline, TextPipeline},
-    vertex::{rect_vertices, TextVertex, Vertex, RECT_INDICES},
+    vertex::{rect_vertices, text_quad_vertices, TextVertex, Vertex, RECT_INDICES},
 };
 
 use kore_font::{FontCache, FontDescription, FontId};
@@ -235,6 +235,7 @@ impl Renderer {
             rect_indices: Vec::new(),
             text_vertices: Vec::new(),
             text_indices: Vec::new(),
+            glyph_draws: Vec::new(),
         })
     }
 
@@ -288,21 +289,52 @@ impl Renderer {
                             continue;
                         }
                     }
-                    let ch_w = t.font_size * 0.55;
-                    let ch_h = t.font_size;
-                    let rect_w = ch_w * 0.8;
-                    let mut cx = t.x;
                     let color = [t.color.r, t.color.g, t.color.b, t.color.a];
+                    let mut cursor_x = t.x;
+                    let mut cache = self.font_cache.borrow_mut();
                     for ch in t.text.chars() {
-                        if ch != ' ' {
-                            let base = frame.rect_vertices.len() as u16;
-                            let verts = rect_vertices(cx, t.y, rect_w, ch_h, color);
-                            frame.rect_vertices.extend_from_slice(&verts);
-                            for &i in &RECT_INDICES {
-                                frame.rect_indices.push(base + i);
+                        if let Some(glyph) = cache.rasterize_glyph(self.font_id, ch, t.font_size) {
+                            if glyph.width > 0 && glyph.height > 0 {
+                                let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                                    label: None,
+                                    size: wgpu::Extent3d { width: glyph.width, height: glyph.height, depth_or_array_layers: 1 },
+                                    mip_level_count: 1,
+                                    sample_count: 1,
+                                    dimension: wgpu::TextureDimension::D2,
+                                    format: wgpu::TextureFormat::R8Unorm,
+                                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                                    view_formats: &[],
+                                });
+                                self.queue.write_texture(
+                                    wgpu::ImageCopyTexture { texture: &texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                                    &glyph.pixels,
+                                    wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(glyph.width), rows_per_image: Some(glyph.height) },
+                                    wgpu::Extent3d { width: glyph.width, height: glyph.height, depth_or_array_layers: 1 },
+                                );
+                                let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+                                let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                                    label: None,
+                                    layout: &self.text_pipeline.texture_bind_group_layout,
+                                    entries: &[
+                                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
+                                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self._placeholder_sampler) },
+                                    ],
+                                });
+                                let dest_x = cursor_x + glyph.x_offset as f32;
+                                let dest_y = t.y - glyph.y_offset as f32 - glyph.height as f32;
+                                let verts = text_quad_vertices(dest_x, dest_y, glyph.width as f32, glyph.height as f32, 0.0, 0.0, 1.0, 1.0, color);
+                                let vertex_base = frame.text_vertices.len() as u16;
+                                frame.text_vertices.extend_from_slice(&verts);
+                                let index_base = frame.text_indices.len() as u32;
+                                for &i in &RECT_INDICES {
+                                    frame.text_indices.push(vertex_base + i);
+                                }
+                                frame.glyph_draws.push(GlyphDraw { index_start: index_base, index_count: 6, bind_group });
                             }
+                            cursor_x += glyph.advance_width;
+                        } else {
+                            cursor_x += t.font_size * 0.6;
                         }
-                        cx += ch_w;
                     }
                 }
                 DisplayCommand::PushClip(c) => {
@@ -397,13 +429,13 @@ impl Renderer {
                         });
 
                 pass.set_pipeline(&self.text_pipeline.pipeline);
-                // Bind group 0 = viewport uniform (shared with rect pipeline)
                 pass.set_bind_group(0, &self.viewport_bind_group, &[]);
-                // Bind group 1 = texture + sampler
-                pass.set_bind_group(1, &self.text_bind_group, &[]);
                 pass.set_vertex_buffer(0, vertex_buffer.slice(..));
                 pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint16);
-                pass.draw_indexed(0..frame.text_indices.len() as u32, 0, 0..1);
+                for draw in &frame.glyph_draws {
+                    pass.set_bind_group(1, &draw.bind_group, &[]);
+                    pass.draw_indexed(draw.index_start..draw.index_start + draw.index_count, 0, 0..1);
+                }
             }
         }
 
@@ -414,10 +446,17 @@ impl Renderer {
     }
 }
 
+struct GlyphDraw {
+    index_start: u32,
+    index_count: u32,
+    bind_group: wgpu::BindGroup,
+}
+
 pub struct FrameRenderer {
     pub(crate) surface_texture: wgpu::SurfaceTexture,
     pub(crate) rect_vertices: Vec<Vertex>,
     pub(crate) rect_indices: Vec<u16>,
     pub(crate) text_vertices: Vec<TextVertex>,
     pub(crate) text_indices: Vec<u16>,
+    glyph_draws: Vec<GlyphDraw>,
 }
