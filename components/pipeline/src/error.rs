@@ -14,6 +14,9 @@ pub enum PipelineError {
     #[error("Layout error: {0:?}")]
     Layout(#[from] kore_layout::LayoutError),
 
+    #[error("JS error: {0}")]
+    Js(String),
+
     #[error("Response body is not valid UTF-8")]
     InvalidUtf8,
 

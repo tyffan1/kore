@@ -13,7 +13,6 @@ use kore_window::{AppEvent, EventLoop, InputEvent, Key, Modifiers, MouseButton, 
 const SEARCH_ENGINES: &[(&str, &str)] = &[
     ("Bing", "https://www.bing.com/search?q="),
     ("DuckDuckGo", "https://html.duckduckgo.com/html/?q="),
-    ("Google", "https://www.google.com/search?q="),
 ];
 
 struct AppState {
@@ -773,7 +772,7 @@ fn navigate(state: &mut AppState, mut url: url::Url) {
     let pipeline = Arc::clone(&state.pipeline);
     let url = url.clone();
     std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
+        let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .expect("Failed to build runtime");

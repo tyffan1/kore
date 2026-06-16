@@ -268,6 +268,9 @@ impl Renderer {
                         if !clip.intersects(&rect_clip) {
                             continue;
                         }
+                        if r.y + r.height < clip.y || r.y > clip.y + clip.height {
+                            continue;
+                        }
                     }
                     let base = frame.rect_vertices.len() as u16;
                     let color = [r.color.r, r.color.g, r.color.b, r.color.a];
@@ -288,6 +291,12 @@ impl Renderer {
                             height: approx_h,
                         };
                         if !clip.intersects(&rect_clip) {
+                            continue;
+                        }
+                        if t.y + t.font_size < clip.y || t.y > clip.y + clip.height {
+                            continue;
+                        }
+                        if t.y < clip.y {
                             continue;
                         }
                     }

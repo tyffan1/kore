@@ -12,9 +12,11 @@ path = "src/lib.rs"
 workspace = true
 
 [dependencies]
+futures = "0.3"
 kore-css = { path = "../css" }
 kore-gpu = { path = "../gpu" }
 kore-html = { path = "../html" }
+kore-js = { path = "../js" }
 kore-layout = { path = "../layout" }
 kore-net = { path = "../net" }
 serde.workspace = true

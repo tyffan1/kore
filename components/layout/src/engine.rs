@@ -83,18 +83,6 @@ impl<'a> LayoutBuilder<'a> {
             .node(self.document.root())
             .ok_or(LayoutError::MissingDomNode)?;
         for child_id in &dom_root.children {
-            if let Some(child) = self.document.node(*child_id) {
-                match &child.kind {
-                    kore_html::NodeKind::Element(el) => {
-                        let style = self.computed_style(el);
-                        eprintln!("build_document child: <{}> display={:?}",
-                            el.tag_name, style.display);
-                    }
-                    _ => eprintln!("build_document child: non-element"),
-                }
-            }
-        }
-        for child_id in &dom_root.children {
             self.build_dom_subtree(*child_id, root)?;
         }
         Ok(root)
@@ -111,7 +99,6 @@ impl<'a> LayoutBuilder<'a> {
             .ok_or(LayoutError::MissingDomNode)?;
         match &dom_node.kind {
             NodeKind::Element(element) => {
-                eprintln!("Processing element: {}", element.tag_name);
                 let mut style = self.computed_style(element);
                 if style.display == Display::None {
                     return Ok(());

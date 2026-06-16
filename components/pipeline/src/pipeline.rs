@@ -1,4 +1,4 @@
-use kore_css::{cascade_for_element, parse_stylesheet, CssColor, ElementSnapshot};
+use kore_css::{parse_stylesheet, CssColor};
 use kore_gpu::{Color, DisplayList, DrawRect, DrawText};
 use kore_html::{parse_document, NodeKind};
 use kore_layout::{layout_document, Display, FontStyle, FontWeight, LayoutConfig, LayoutTree};
@@ -80,19 +80,19 @@ impl Pipeline {
         let html_str = self.fetch_html(url).await?;
         let document = parse_document(&html_str)?;
 
-        if let Some(root_node) = document.node(document.root()) {
-            eprintln!("Document root children: {}", root_node.children.len());
-            for child_id in &root_node.children {
-                if let Some(child) = document.node(*child_id) {
-                    match &child.kind {
-                        kore_html::NodeKind::Element(el) => {
-                            eprintln!("  Root child: <{}> with {} children",
-                                el.tag_name, child.children.len());
-                        }
-                        kore_html::NodeKind::Text(t) => {
-                            eprintln!("  Root child: text {:?}", &t[..t.len().min(30)]);
-                        }
-                        _ => eprintln!("  Root child: other"),
+        let js_runtime = kore_js::JsRuntime::new()
+            .map_err(|e| PipelineError::Js(e.to_string()))?;
+        for node in document.nodes() {
+            if let kore_html::NodeKind::Element(el) = &node.kind {
+                if el.tag_name.eq_ignore_ascii_case("script") {
+                    let script: String = node.children.iter()
+                        .filter_map(|id| document.node(*id))
+                        .filter_map(|n| if let kore_html::NodeKind::Text(t) = &n.kind {
+                            Some(t.as_str())
+                        } else { None })
+                        .collect();
+                    if !script.trim().is_empty() {
+                        let _ = js_runtime.eval(&script);
                     }
                 }
             }
@@ -102,8 +102,15 @@ impl Pipeline {
 
         let mut stylesheets = vec![DEFAULT_CSS.to_string()];
 
-        for css_url in linked_stylesheets(&document, url) {
-            if let Ok(css) = self.fetch_css(&css_url).await {
+        let css_futures: Vec<_> = linked_stylesheets(&document, url)
+            .into_iter()
+            .map(|css_url| {
+                let url = css_url.clone();
+                async move { self.fetch_css(&url).await }
+            })
+            .collect();
+        for result in futures::future::join_all(css_futures).await {
+            if let Ok(css) = result {
                 stylesheets.push(css);
             }
         }
@@ -128,14 +135,6 @@ impl Pipeline {
             width,
         );
         let links = extract_links(&document, &layout_tree);
-
-        eprintln!("HTML length: {}", html_str.len());
-        eprintln!("DOM nodes: {}", document.nodes().len());
-        eprintln!("Layout nodes: {}", layout_tree.nodes.len());
-        eprintln!("Display list commands: {}", display_list.len());
-        for cmd in display_list.commands() {
-            eprintln!("Command: {:?}", cmd);
-        }
 
         Ok(RenderOutput { display_list, title, links })
     }
@@ -218,16 +217,6 @@ fn default_bg_color(tag_name: &str) -> Option<Color> {
     }
 }
 
-fn parse_display(value: &str) -> Display {
-    match value {
-        "none" => Display::None,
-        "inline" => Display::Inline,
-        "inline-block" => Display::InlineBlock,
-        "flex" | "inline-flex" => Display::Flex,
-        _ => Display::Block,
-    }
-}
-
 fn default_display_for_tag(tag_name: &str) -> Display {
     match tag_name {
         "html" | "body" | "div" | "p" | "h1" | "h2" | "h3" | "h4"
@@ -274,13 +263,11 @@ fn traverse_node(
     let Some(node) = document.node(dom_id) else { return };
     match &node.kind {
         NodeKind::Element(el) => {
-            let snapshot = ElementSnapshot::new(&el.tag_name);
-            let properties = cascade_for_element(stylesheet, &snapshot);
-            let display = properties
-                .iter()
-                .find(|p| p.property == "display")
-                .map(|p| parse_display(&p.value))
-                .unwrap_or_else(|| default_display_for_tag(&el.tag_name));
+            let display = if let Some(ln) = layout_tree.nodes.iter().find(|n| n.dom_node_id == Some(dom_id)) {
+                ln.style.display
+            } else {
+                default_display_for_tag(&el.tag_name)
+            };
 
             if display == Display::None {
                 return;
