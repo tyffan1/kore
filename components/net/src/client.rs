@@ -60,7 +60,10 @@ pub struct HttpClientConfig {
 impl Default for HttpClientConfig {
     fn default() -> Self {
         Self {
-            policy: NetworkPolicy::default(),
+            policy: NetworkPolicy {
+                user_agent: "Kore/0.1.0".to_string(),
+                ..NetworkPolicy::default()
+            },
             connect_timeout: Duration::from_secs(10),
         }
     }
@@ -132,6 +135,14 @@ impl HttpClient {
                 .header(
                     hyper::header::USER_AGENT,
                     self.config.policy.user_agent.as_str(),
+                )
+                .header(
+                    hyper::header::ACCEPT,
+                    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                )
+                .header(
+                    hyper::header::ACCEPT_LANGUAGE,
+                    "en-US,en;q=0.5",
                 )
                 .body(Empty::<Bytes>::new())?;
 

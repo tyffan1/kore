@@ -17,10 +17,8 @@ pub enum Token {
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum TokenizerError {
-    #[error("unterminated markup declaration")]
-    UnterminatedDeclaration,
-    #[error("unterminated quoted attribute value")]
-    UnterminatedAttributeValue,
+    #[error("parse error")]
+    ParseError,
 }
 
 #[derive(Debug)]
@@ -60,20 +58,22 @@ impl<'a> HtmlTokenizer<'a> {
 
     fn comment(&mut self) -> Result<Token, TokenizerError> {
         self.cursor += 4;
-        let Some(end) = self.remaining().find("-->") else {
-            return Err(TokenizerError::UnterminatedDeclaration);
-        };
+        let end = self.remaining().find("-->").unwrap_or(self.remaining().len());
         let comment = self.remaining()[..end].to_string();
-        self.cursor += end + 3;
+        self.cursor += end;
+        if end < self.remaining().len() {
+            self.cursor += 3;
+        }
         Ok(Token::Comment(comment))
     }
 
     fn declaration(&mut self) -> Result<Token, TokenizerError> {
-        let Some(end) = self.remaining().find('>') else {
-            return Err(TokenizerError::UnterminatedDeclaration);
-        };
+        let end = self.remaining().find('>').unwrap_or(self.remaining().len());
         let declaration = self.remaining()[2..end].trim().to_string();
-        self.cursor += end + 1;
+        self.cursor += end;
+        if end < self.remaining().len() {
+            self.cursor += 1;
+        }
         let lower = declaration.to_ascii_lowercase();
         if let Some(name) = lower.strip_prefix("doctype") {
             let original_name = declaration[7..].trim();
@@ -198,7 +198,8 @@ impl<'a> AttributeScanner<'a> {
                     }
                     self.cursor += ch.len_utf8();
                 }
-                Err(TokenizerError::UnterminatedAttributeValue)
+                let value = self.input[start..self.cursor].to_string();
+                Ok(value)
             }
             Some(_) => {
                 let start = self.cursor;

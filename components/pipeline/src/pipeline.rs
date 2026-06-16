@@ -1,4 +1,4 @@
-use kore_css::{parse_stylesheet, CssColor};
+use kore_css::{cascade_for_element, parse_stylesheet, CssColor, ElementSnapshot};
 use kore_gpu::{Color, DisplayList, DrawRect, DrawText};
 use kore_html::{parse_document, NodeKind};
 use kore_layout::{layout_document, Display, FontStyle, FontWeight, LayoutConfig, LayoutTree};
@@ -8,26 +8,44 @@ use url::Url;
 use crate::error::PipelineError;
 
 const DEFAULT_CSS: &str = r#"
-html, body, div, p, h1, h2, h3, h4, h5, h6, ul, ol, li,
-header, footer, main, nav, section, article, aside,
-figure, figcaption, blockquote, dl, dt, dd, form, table {
-    display: block;
-}
-head, script, style, link, meta, title {
-    display: none;
-}
-body {
-    margin: 8px;
-    font-size: 15px;
-    color: black;
-}
-p { margin: 16px 0; }
-h1 { font-size: 32px; font-weight: bold; margin: 32px 0; }
-h2 { font-size: 24px; font-weight: bold; margin: 24px 0; }
-h3 { font-size: 18px; font-weight: bold; margin: 20px 0; }
-div { margin: 8px 0; }
-b, strong { font-weight: bold; }
-i, em { font-style: italic; }
+html { display: block !important; }
+body { display: block !important; margin: 8px; font-size: 15px; color: black; }
+div { display: block !important; margin: 8px 0; }
+p { display: block !important; margin: 16px 0; }
+h1 { display: block !important; font-size: 32px; font-weight: bold; margin: 32px 0; }
+h2 { display: block !important; font-size: 24px; font-weight: bold; margin: 24px 0; }
+h3 { display: block !important; font-size: 18px; font-weight: bold; margin: 20px 0; }
+h4 { display: block !important; }
+h5 { display: block !important; }
+h6 { display: block !important; }
+ul { display: block !important; }
+ol { display: block !important; }
+li { display: block !important; }
+header { display: block !important; }
+footer { display: block !important; }
+main { display: block !important; }
+nav { display: block !important; }
+section { display: block !important; }
+article { display: block !important; }
+aside { display: block !important; }
+figure { display: block !important; }
+figcaption { display: block !important; }
+blockquote { display: block !important; }
+dl { display: block !important; }
+dt { display: block !important; }
+dd { display: block !important; }
+form { display: block !important; }
+table { display: block !important; }
+head { display: none !important; }
+script { display: none !important; }
+style { display: none !important; }
+link { display: none !important; }
+meta { display: none !important; }
+title { display: none !important; }
+b { font-weight: bold; }
+strong { font-weight: bold; }
+i { font-style: italic; }
+em { font-style: italic; }
 "#;
 
 /// Result of a full render pipeline run.
@@ -62,6 +80,24 @@ impl Pipeline {
         let html_str = self.fetch_html(url).await?;
         let document = parse_document(&html_str)?;
 
+        if let Some(root_node) = document.node(document.root()) {
+            eprintln!("Document root children: {}", root_node.children.len());
+            for child_id in &root_node.children {
+                if let Some(child) = document.node(*child_id) {
+                    match &child.kind {
+                        kore_html::NodeKind::Element(el) => {
+                            eprintln!("  Root child: <{}> with {} children",
+                                el.tag_name, child.children.len());
+                        }
+                        kore_html::NodeKind::Text(t) => {
+                            eprintln!("  Root child: text {:?}", &t[..t.len().min(30)]);
+                        }
+                        _ => eprintln!("  Root child: other"),
+                    }
+                }
+            }
+        }
+
         let title = page_title(&document);
 
         let mut stylesheets = vec![DEFAULT_CSS.to_string()];
@@ -85,8 +121,21 @@ impl Pipeline {
             },
         )?;
 
-        let display_list = build_display_list(&document, &layout_tree);
+        let display_list = build_display_list_recursive(
+            &document,
+            &layout_tree,
+            &stylesheet,
+            width,
+        );
         let links = extract_links(&document, &layout_tree);
+
+        eprintln!("HTML length: {}", html_str.len());
+        eprintln!("DOM nodes: {}", document.nodes().len());
+        eprintln!("Layout nodes: {}", layout_tree.nodes.len());
+        eprintln!("Display list commands: {}", display_list.len());
+        for cmd in display_list.commands() {
+            eprintln!("Command: {:?}", cmd);
+        }
 
         Ok(RenderOutput { display_list, title, links })
     }
@@ -166,6 +215,108 @@ fn default_bg_color(tag_name: &str) -> Option<Color> {
     match tag_name {
         "html" | "body" => Some(Color::from_rgba8(255, 255, 255, 255)),
         _ => None,
+    }
+}
+
+fn parse_display(value: &str) -> Display {
+    match value {
+        "none" => Display::None,
+        "inline" => Display::Inline,
+        "inline-block" => Display::InlineBlock,
+        "flex" | "inline-flex" => Display::Flex,
+        _ => Display::Block,
+    }
+}
+
+fn default_display_for_tag(tag_name: &str) -> Display {
+    match tag_name {
+        "html" | "body" | "div" | "p" | "h1" | "h2" | "h3" | "h4"
+        | "h5" | "h6" | "ul" | "ol" | "li" | "header" | "footer"
+        | "main" | "nav" | "section" | "article" | "aside" | "form"
+        | "table" | "tr" | "td" | "th" | "thead" | "tbody" | "tfoot"
+        | "figure" | "figcaption" | "blockquote" | "dl" | "dt" | "dd"
+            => Display::Block,
+        "a" | "b" | "em" | "i" | "label" | "span" | "strong" | "button"
+            => Display::Inline,
+        "script" | "style" | "template" | "head" | "link" | "meta" | "title"
+            => Display::None,
+        _ => Display::Block,
+    }
+}
+
+pub fn build_display_list_recursive(
+    document: &kore_html::Document,
+    layout_tree: &LayoutTree,
+    stylesheet: &kore_css::StyleSheet,
+    viewport_width: f32,
+) -> DisplayList {
+    let mut dl = DisplayList::new();
+    let mut cursor_y = 24.0;
+
+    if let Some(root) = document.node(document.root()) {
+        for child_id in &root.children {
+            traverse_node(*child_id, document, layout_tree, stylesheet, viewport_width, &mut cursor_y, &mut dl);
+        }
+    }
+
+    dl
+}
+
+fn traverse_node(
+    dom_id: kore_html::NodeId,
+    document: &kore_html::Document,
+    layout_tree: &LayoutTree,
+    stylesheet: &kore_css::StyleSheet,
+    viewport_width: f32,
+    cursor_y: &mut f32,
+    dl: &mut DisplayList,
+) {
+    let Some(node) = document.node(dom_id) else { return };
+    match &node.kind {
+        NodeKind::Element(el) => {
+            let snapshot = ElementSnapshot::new(&el.tag_name);
+            let properties = cascade_for_element(stylesheet, &snapshot);
+            let display = properties
+                .iter()
+                .find(|p| p.property == "display")
+                .map(|p| parse_display(&p.value))
+                .unwrap_or_else(|| default_display_for_tag(&el.tag_name));
+
+            if display == Display::None {
+                return;
+            }
+
+            if let Some(ln) = layout_tree.nodes.iter().find(|n| n.dom_node_id == Some(dom_id)) {
+                if ln.rect.width > 0.0 && ln.rect.height > 0.0 {
+                    if let Some(color) = ln.style.background_color.map(to_gpu_color).or_else(|| default_bg_color(&el.tag_name)) {
+                        dl.push_rect(DrawRect { x: ln.rect.x, y: ln.rect.y, width: ln.rect.width, height: ln.rect.height, color });
+                    }
+                }
+            }
+
+            for child_id in &node.children {
+                traverse_node(*child_id, document, layout_tree, stylesheet, viewport_width, cursor_y, dl);
+            }
+        }
+        NodeKind::Text(text) => {
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                let font_size = 16.0;
+                *cursor_y += font_size * 1.5;
+                let x = 10.0;
+                dl.push_text(DrawText {
+                    x,
+                    y: *cursor_y,
+                    text: trimmed.to_string(),
+                    font_size,
+                    color: Color::BLACK,
+                    font_family: Some("sans-serif".to_string()),
+                    bold: false,
+                    italic: false,
+                });
+            }
+        }
+        _ => {}
     }
 }
 

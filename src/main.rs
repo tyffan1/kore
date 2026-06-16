@@ -5,14 +5,15 @@ use std::time::Instant;
 
 use clipboard::ClipboardProvider;
 use kore_browser::BrowserApp;
+use kore_devtools::DevTools;
 use kore_gpu::{ClipRect, Color, DisplayCommand, DisplayList, DrawRect, DrawText, Renderer, RendererConfig};
 use kore_pipeline::{Pipeline, RenderOutput};
 use kore_window::{AppEvent, EventLoop, InputEvent, Key, Modifiers, MouseButton, WindowBuilder, WindowHandle};
 
 const SEARCH_ENGINES: &[(&str, &str)] = &[
-    ("Brave", "https://search.brave.com/search?q="),
-    ("DuckDuckGo", "https://html.duckduckgo.com/html/?q="),
     ("Bing", "https://www.bing.com/search?q="),
+    ("DuckDuckGo", "https://html.duckduckgo.com/html/?q="),
+    ("Google", "https://www.google.com/search?q="),
 ];
 
 struct AppState {
@@ -46,6 +47,7 @@ struct AppState {
     search_engine_index: usize,
     render_tx: mpsc::SyncSender<RenderOutput>,
     render_rx: mpsc::Receiver<RenderOutput>,
+    devtools: DevTools,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -102,6 +104,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         search_engine_index: 0,
         render_tx: tx,
         render_rx: rx,
+        devtools: DevTools::new(),
     });
 
     let renderer = RefCell::new(None::<Renderer>);
@@ -446,10 +449,15 @@ fn handle_mouse_click(state: &mut AppState, x: f64, y: f64) {
     for (lx, ly, lw, lh, href) in &state.page_links {
         if x >= *lx as f64
             && x <= (*lx + *lw) as f64
-            && y >= (*ly + 72.0 - sy) as f64
-            && y <= (*ly + 72.0 + *lh - sy) as f64
+            && y >= (72.0 + *ly - sy) as f64
+            && y <= (72.0 + *ly + *lh - sy) as f64
         {
-            if let Ok(url) = parse_url(href, state.search_engine_index) {
+            let url = if href.starts_with("http://") || href.starts_with("https://") {
+                url::Url::parse(href).ok()
+            } else {
+                parse_url(href, state.search_engine_index).ok()
+            };
+            if let Some(url) = url {
                 navigate(state, url);
             }
             break;
@@ -640,6 +648,11 @@ fn handle_global_shortcuts(state: &mut AppState, key: Key, modifiers: Modifiers)
                 navigate(state, tab.url.clone());
             }
         }
+        Key::I if modifiers.shift => {
+            eprintln!("DevTools toggled");
+            state.devtools.toggle();
+            return;
+        }
         Key::L => {
             state.address_bar_focused = true;
             if let Some(active) = state.browser.tab_manager.active_tab() {
@@ -764,8 +777,13 @@ fn navigate(state: &mut AppState, mut url: url::Url) {
             .enable_all()
             .build()
             .expect("Failed to build runtime");
-        if let Ok(output) = rt.block_on(pipeline.render(&url)) {
-            let _ = tx.send(output);
+        match rt.block_on(pipeline.render(&url)) {
+            Ok(output) => {
+                let _ = tx.send(output);
+            }
+            Err(e) => {
+                eprintln!("Pipeline error: {e}");
+            }
         }
     });
 }
@@ -969,20 +987,16 @@ fn draw_address_bar(
         Color::BLACK
     };
 
-    let mut char_x = text_x;
-    for ch in display_text.chars() {
-        list.push_text(DrawText {
-            x: char_x,
-            y: text_y,
-            text: ch.to_string(),
-            font_size,
-            color: text_color,
-            font_family: Some("sans-serif".to_string()),
-            bold: false,
-            italic: false,
-        });
-        char_x += font_size * 0.6;
-    }
+    list.push_text(DrawText {
+        x: text_x,
+        y: text_y,
+        text: display_text,
+        font_size,
+        color: text_color,
+        font_family: Some("sans-serif".to_string()),
+        bold: false,
+        italic: false,
+    });
 
     if focused {
         let cursor_x = text_x + (cursor_pos as f32 * font_size * 0.6);

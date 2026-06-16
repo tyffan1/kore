@@ -1,4 +1,6 @@
 use std::cell::RefCell;
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use wgpu::util::DeviceExt;
 
@@ -42,6 +44,7 @@ pub struct Renderer {
     _placeholder_sampler: wgpu::Sampler,
     font_cache: RefCell<FontCache>,
     font_id: FontId,
+    glyph_texture_cache: RefCell<HashMap<(usize, char, u32), Arc<wgpu::BindGroup>>>,
 }
 
 impl Renderer {
@@ -201,6 +204,7 @@ impl Renderer {
             _placeholder_sampler: placeholder_sampler,
             font_cache: RefCell::new(font_cache),
             font_id,
+            glyph_texture_cache: RefCell::new(HashMap::new()),
         })
     }
 
@@ -249,8 +253,6 @@ impl Renderer {
             return;
         }
 
-        eprintln!("submit: {} commands", list.commands().len());
-
         let mut clip_stack: Vec<crate::display_list::ClipRect> = Vec::new();
 
         for cmd in list.commands() {
@@ -291,35 +293,46 @@ impl Renderer {
                     }
                     let color = [t.color.r, t.color.g, t.color.b, t.color.a];
                     let mut cursor_x = t.x;
-                    let mut cache = self.font_cache.borrow_mut();
+                    let mut font_cache = self.font_cache.borrow_mut();
                     for ch in t.text.chars() {
-                        if let Some(glyph) = cache.rasterize_glyph(self.font_id, ch, t.font_size) {
+                        if let Some(glyph) = font_cache.rasterize_glyph(self.font_id, ch, t.font_size) {
                             if glyph.width > 0 && glyph.height > 0 {
-                                let texture = self.device.create_texture(&wgpu::TextureDescriptor {
-                                    label: None,
-                                    size: wgpu::Extent3d { width: glyph.width, height: glyph.height, depth_or_array_layers: 1 },
-                                    mip_level_count: 1,
-                                    sample_count: 1,
-                                    dimension: wgpu::TextureDimension::D2,
-                                    format: wgpu::TextureFormat::R8Unorm,
-                                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                                    view_formats: &[],
-                                });
-                                self.queue.write_texture(
-                                    wgpu::ImageCopyTexture { texture: &texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-                                    &glyph.pixels,
-                                    wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(glyph.width), rows_per_image: Some(glyph.height) },
-                                    wgpu::Extent3d { width: glyph.width, height: glyph.height, depth_or_array_layers: 1 },
-                                );
-                                let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-                                let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                                    label: None,
-                                    layout: &self.text_pipeline.texture_bind_group_layout,
-                                    entries: &[
-                                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
-                                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self._placeholder_sampler) },
-                                    ],
-                                });
+                                let cache_key = (self.font_id.0, ch, t.font_size.to_bits());
+                                let bind_group = {
+                                    let mut glyph_cache = self.glyph_texture_cache.borrow_mut();
+                                    if let Some(cached) = glyph_cache.get(&cache_key) {
+                                        cached.clone()
+                                    } else {
+                                        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                                            label: None,
+                                            size: wgpu::Extent3d { width: glyph.width, height: glyph.height, depth_or_array_layers: 1 },
+                                            mip_level_count: 1,
+                                            sample_count: 1,
+                                            dimension: wgpu::TextureDimension::D2,
+                                            format: wgpu::TextureFormat::R8Unorm,
+                                            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                                            view_formats: &[],
+                                        });
+                                        self.queue.write_texture(
+                                            wgpu::ImageCopyTexture { texture: &texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                                            &glyph.pixels,
+                                            wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(glyph.width), rows_per_image: Some(glyph.height) },
+                                            wgpu::Extent3d { width: glyph.width, height: glyph.height, depth_or_array_layers: 1 },
+                                        );
+                                        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+                                        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                                            label: None,
+                                            layout: &self.text_pipeline.texture_bind_group_layout,
+                                            entries: &[
+                                                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
+                                                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self._placeholder_sampler) },
+                                            ],
+                                        });
+                                        let arc_bg = Arc::new(bind_group);
+                                        glyph_cache.insert(cache_key, arc_bg.clone());
+                                        arc_bg
+                                    }
+                                };
                                 let dest_x = cursor_x + glyph.x_offset as f32;
                                 let dest_y = t.y - glyph.y_offset as f32 - glyph.height as f32;
                                 let verts = text_quad_vertices(dest_x, dest_y, glyph.width as f32, glyph.height as f32, 0.0, 0.0, 1.0, 1.0, color);
@@ -327,7 +340,7 @@ impl Renderer {
                                 frame.text_vertices.extend_from_slice(&verts);
                                 let index_base = frame.text_indices.len() as u32;
                                 for &i in &RECT_INDICES {
-                                    frame.text_indices.push(vertex_base + i);
+                                    frame.text_indices.push(vertex_base as u32 + i as u32);
                                 }
                                 frame.glyph_draws.push(GlyphDraw { index_start: index_base, index_count: 6, bind_group });
                             }
@@ -431,9 +444,9 @@ impl Renderer {
                 pass.set_pipeline(&self.text_pipeline.pipeline);
                 pass.set_bind_group(0, &self.viewport_bind_group, &[]);
                 pass.set_vertex_buffer(0, vertex_buffer.slice(..));
-                pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+                pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 for draw in &frame.glyph_draws {
-                    pass.set_bind_group(1, &draw.bind_group, &[]);
+                    pass.set_bind_group(1, &*draw.bind_group, &[]);
                     pass.draw_indexed(draw.index_start..draw.index_start + draw.index_count, 0, 0..1);
                 }
             }
@@ -449,7 +462,7 @@ impl Renderer {
 struct GlyphDraw {
     index_start: u32,
     index_count: u32,
-    bind_group: wgpu::BindGroup,
+    bind_group: Arc<wgpu::BindGroup>,
 }
 
 pub struct FrameRenderer {
@@ -457,6 +470,6 @@ pub struct FrameRenderer {
     pub(crate) rect_vertices: Vec<Vertex>,
     pub(crate) rect_indices: Vec<u16>,
     pub(crate) text_vertices: Vec<TextVertex>,
-    pub(crate) text_indices: Vec<u16>,
+    pub(crate) text_indices: Vec<u32>,
     glyph_draws: Vec<GlyphDraw>,
 }

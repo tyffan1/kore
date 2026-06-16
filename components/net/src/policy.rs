@@ -14,7 +14,7 @@ impl Default for NetworkPolicy {
         Self {
             allow_plain_http: true,
             max_body_bytes: 16 * 1024 * 1024,
-            user_agent: "Kore/0.1.0".to_string(),
+            user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36".to_string(),
         }
     }
 }

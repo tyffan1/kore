@@ -51,6 +51,7 @@ panic = "deny"
 clipboard = "0.5"
 kore-browser = { path = "components/browser" }
 kore-css = { path = "components/css" }
+kore-devtools = { path = "components/devtools" }
 kore-gpu = { path = "components/gpu" }
 kore-html = { path = "components/html" }
 kore-layout = { path = "components/layout" }

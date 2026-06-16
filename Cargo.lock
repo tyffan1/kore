@@ -1388,6 +1388,7 @@ dependencies = [
  "clipboard",
  "kore-browser",
  "kore-css",
+ "kore-devtools",
  "kore-gpu",
  "kore-html",
  "kore-layout",
