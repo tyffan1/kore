@@ -13,4 +13,5 @@ workspace = true
 
 [dependencies]
 boa_engine = "0.19"
+kore-html = { path = "../html" }
 thiserror.workspace = true

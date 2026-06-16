@@ -66,7 +66,7 @@ impl Document {
         self.nodes.get(id.0)
     }
 
-    pub(crate) fn append(&mut self, parent: NodeId, kind: NodeKind) -> NodeId {
+    pub fn append(&mut self, parent: NodeId, kind: NodeKind) -> NodeId {
         let id = NodeId(self.nodes.len());
         self.nodes.push(Node {
             id,
