@@ -42,6 +42,7 @@ impl From<BoaJsError> for JsError {
 pub struct JsRuntime {
     context: RefCell<Context>,
     document: Arc<Mutex<Document>>,
+    pub pending_navigation: Arc<Mutex<Option<String>>>,
 }
 
 impl JsRuntime {
@@ -50,6 +51,7 @@ impl JsRuntime {
         let rt = Self {
             context: RefCell::new(context),
             document,
+            pending_navigation: Arc::new(Mutex::new(None)),
         };
         rt.init_bindings()?;
         Ok(rt)
@@ -69,6 +71,7 @@ impl JsRuntime {
     fn init_bindings(&self) -> Result<(), JsError> {
         let mut ctx = self.context.borrow_mut();
         let doc = self.document.clone();
+        let nav_sink = self.pending_navigation.clone();
 
         let console_log = NativeFunction::from_fn_ptr(|_, args, context| {
             let parts: Vec<String> = args.iter().map(|v| boa_debug_value(v, context)).collect();
@@ -89,11 +92,26 @@ var console = {
         ))
         .map_err(|e| JsError::Context(e.to_string()))?;
 
-        let document_obj = build_document_object(&mut ctx, &doc)?;
+        let set_href_fn = unsafe {
+            NativeFunction::from_closure(move |_, args, _| {
+                let url = args.first()
+                    .and_then(|v| v.as_string())
+                    .map(|s| s.to_std_string_escaped())
+                    .unwrap_or_default();
+                if !url.is_empty() {
+                    *nav_sink.lock().unwrap() = Some(url);
+                }
+                Ok(BoaValue::Undefined)
+            })
+        };
+        ctx.register_global_callable(JsString::from("__window_location_set_href"), 1, set_href_fn)
+            .map_err(|e| JsError::Context(e.to_string()))?;
+
+        let document_obj = build_document_object(&mut ctx, &doc, &self.pending_navigation)?;
         ctx.register_global_property(JsString::from("document"), document_obj.clone(), Attribute::all())
             .map_err(|e| JsError::Context(e.to_string()))?;
 
-        let window_obj = build_window_object(&mut ctx)?;
+        let window_obj = build_window_object(&mut ctx, &self.pending_navigation)?;
         ctx.register_global_property(JsString::from("window"), window_obj.clone(), Attribute::all())
             .map_err(|e| JsError::Context(e.to_string()))?;
 
@@ -117,6 +135,35 @@ var console = {
             }
         }
 
+        ctx.eval(Source::from_bytes(
+            r#"
+var XMLHttpRequest = function() {
+    this.readyState = 0;
+    this.status = 0;
+    this.responseText = '';
+    this.open = function(method, url) { this._url = url; };
+    this.send = function() { this.readyState = 4; this.status = 200; };
+    this.setRequestHeader = function() {};
+};
+"#,
+        ))
+        .map_err(|e| JsError::Context(e.to_string()))?;
+
+        ctx.eval(Source::from_bytes(
+            r#"
+window.fetch = function(url) {
+    return Promise.resolve({
+        ok: true,
+        status: 200,
+        text: function() { return Promise.resolve(''); },
+        json: function() { return Promise.resolve({}); }
+    });
+};
+var fetch = window.fetch;
+"#,
+        ))
+        .map_err(|e| JsError::Context(e.to_string()))?;
+
         Ok(())
     }
 }
@@ -126,6 +173,7 @@ var console = {
 fn build_document_object(
     ctx: &mut Context,
     doc: &Arc<Mutex<Document>>,
+    nav_sink: &Arc<Mutex<Option<String>>>,
 ) -> Result<JsObject, JsError> {
     let document_obj = JsObject::with_null_proto();
 
@@ -393,7 +441,7 @@ fn build_document_object(
     document_obj.set(JsString::from("cookie"), JsString::from(""), false, ctx)
         .map_err(|e| JsError::Context(e.to_string()))?;
 
-    let location_obj = build_location_object(ctx);
+    let location_obj = build_location_object(ctx, nav_sink);
     document_obj.set(JsString::from("location"), location_obj, false, ctx)
         .map_err(|e| JsError::Context(e.to_string()))?;
 
@@ -850,10 +898,10 @@ fn create_element_object(
 
 // ============ Window Object ============
 
-fn build_window_object(ctx: &mut Context) -> Result<JsObject, JsError> {
+fn build_window_object(ctx: &mut Context, nav_sink: &Arc<Mutex<Option<String>>>) -> Result<JsObject, JsError> {
     let win = JsObject::with_null_proto();
 
-    let location_obj = build_location_object(ctx);
+    let location_obj = build_location_object(ctx, nav_sink);
     win.set(JsString::from("location"), location_obj, false, ctx)
         .map_err(|e| JsError::Context(e.to_string()))?;
 
@@ -899,14 +947,31 @@ fn build_window_object(ctx: &mut Context) -> Result<JsObject, JsError> {
 
 // ============ Location Object ============
 
-fn build_location_object(ctx: &mut Context) -> JsObject {
+fn build_location_object(ctx: &mut Context, nav_sink: &Arc<Mutex<Option<String>>>) -> JsObject {
     let loc = JsObject::with_null_proto();
 
     let hf = FunctionObjectBuilder::new(ctx.realm(), NativeFunction::from_fn_ptr(|_, _, _| Ok(BoaValue::String(JsString::from("about:blank")))))
         .name("get href").build();
+    let hs = {
+        let nav_sink = nav_sink.clone();
+        unsafe {
+            NativeFunction::from_closure(move |_, args, _| {
+                let url = args.first()
+                    .and_then(|v| v.as_string())
+                    .map(|s| s.to_std_string_escaped())
+                    .unwrap_or_default();
+                if !url.is_empty() {
+                    *nav_sink.lock().unwrap() = Some(url);
+                }
+                Ok(BoaValue::Undefined)
+            })
+        }
+    };
+    let hs_obj = FunctionObjectBuilder::new(ctx.realm(), hs)
+        .name("set href").length(1).build();
     loc.define_property_or_throw(
         JsString::from("href"),
-        PropertyDescriptor::builder().get(hf).enumerable(true).configurable(true).build(),
+        PropertyDescriptor::builder().get(hf).set(hs_obj).enumerable(true).configurable(true).build(),
         ctx,
     ).ok();
 
@@ -1392,6 +1457,45 @@ mod tests {
                 QJsValue::Int(6),
             ])
         );
+        Ok(())
+    }
+
+    #[test]
+    fn window_location_set_href_stores_pending_navigation() -> Result<(), JsError> {
+        let rt = JsRuntime::new(make_doc())?;
+        rt.eval("window.location.href = 'https://example.com'")?;
+        let nav = rt.pending_navigation.lock().unwrap().take();
+        assert_eq!(nav, Some("https://example.com".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn window_location_set_href_via_underscore_fn() -> Result<(), JsError> {
+        let rt = JsRuntime::new(make_doc())?;
+        rt.eval("__window_location_set_href('https://test.dev/path')")?;
+        let nav = rt.pending_navigation.lock().unwrap().take();
+        assert_eq!(nav, Some("https://test.dev/path".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn xml_http_request_can_be_instantiated() -> Result<(), JsError> {
+        let rt = JsRuntime::new(make_doc())?;
+        let result = rt.eval(r#"
+var xhr = new XMLHttpRequest();
+xhr.open('GET', '/test');
+xhr.send();
+xhr.readyState;
+"#)?;
+        assert_eq!(result, QJsValue::Int(4));
+        Ok(())
+    }
+
+    #[test]
+    fn fetch_returns_thenable() -> Result<(), JsError> {
+        let rt = JsRuntime::new(make_doc())?;
+        let result = rt.eval("var p = fetch('/test'); typeof p.then")?;
+        assert_eq!(result, QJsValue::String("function".to_string()));
         Ok(())
     }
 }

@@ -92,12 +92,25 @@ mod tests {
 
     #[test]
     fn load_extension_adds_to_list() -> Result<(), ExtensionError> {
-        let dir = test_manifest_path();
+        let dir = tempfile::tempdir().map_err(|e| ExtensionError::Io {
+            path: std::path::PathBuf::from("tempdir"),
+            source: e,
+        })?;
+        let manifest = r#"{
+            "manifest_version": 2,
+            "name": "Test Extension",
+            "version": "1.0.0"
+        }"#;
+        std::fs::write(dir.path().join("manifest.json"), manifest).map_err(|e| {
+            ExtensionError::Io {
+                path: dir.path().join("manifest.json"),
+                source: e,
+            }
+        })?;
         let mut mgr = ExtensionManager::new();
-        let id = mgr.load_extension(&dir)?;
+        let id = mgr.load_extension(dir.path())?;
         assert_eq!(mgr.count(), 1);
         assert!(mgr.is_loaded(&id));
-        let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     }
 

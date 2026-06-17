@@ -16,5 +16,6 @@ kore-ipc = { path = "../ipc" }
 kore-sandbox = { path = "../sandbox" }
 serde.workspace = true
 serde_json = "1.0"
+tempfile = "3"
 thiserror.workspace = true
 url.workspace = true

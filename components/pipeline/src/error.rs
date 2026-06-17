@@ -25,4 +25,7 @@ pub enum PipelineError {
 
     #[error("Missing linked stylesheet href")]
     MissingStylesheetHref,
+
+    #[error("Too many redirects")]
+    RedirectLimit,
 }

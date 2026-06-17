@@ -78,79 +78,90 @@ impl Pipeline {
 
     /// Run the full pipeline: fetch, parse, style, layout, and build a display list.
     pub async fn render(&self, url: &Url) -> Result<RenderOutput, PipelineError> {
-        let html_str = self.fetch_html(url).await?;
-        let document = Arc::new(std::sync::Mutex::new(parse_document(&html_str)?));
+        let mut current_url = url.clone();
+        for _hop in 0..5 {
+            let html_str = self.fetch_html(&current_url).await?;
+            let document = Arc::new(std::sync::Mutex::new(parse_document(&html_str)?));
 
-        let js_runtime = kore_js::JsRuntime::new(document.clone())
-            .map_err(|e| PipelineError::Js(e.to_string()))?;
-        let scripts: Vec<String> = {
-            let d = document.lock().unwrap();
-            d.nodes().iter()
-                .filter_map(|node| {
-                    if let kore_html::NodeKind::Element(el) = &node.kind {
-                        if el.tag_name.eq_ignore_ascii_case("script") {
-                            let script: String = node.children.iter()
-                                .filter_map(|id| d.node(*id))
-                                .filter_map(|n| if let kore_html::NodeKind::Text(t) = &n.kind {
-                                    Some(t.as_str())
-                                } else { None })
-                                .collect();
-                            if !script.trim().is_empty() {
-                                return Some(script);
+            let js_runtime = kore_js::JsRuntime::new(document.clone())
+                .map_err(|e| PipelineError::Js(e.to_string()))?;
+            let scripts: Vec<String> = {
+                let d = document.lock().unwrap();
+                d.nodes().iter()
+                    .filter_map(|node| {
+                        if let kore_html::NodeKind::Element(el) = &node.kind {
+                            if el.tag_name.eq_ignore_ascii_case("script") {
+                                let script: String = node.children.iter()
+                                    .filter_map(|id| d.node(*id))
+                                    .filter_map(|n| if let kore_html::NodeKind::Text(t) = &n.kind {
+                                        Some(t.as_str())
+                                    } else { None })
+                                    .collect();
+                                if !script.trim().is_empty() {
+                                    return Some(script);
+                                }
                             }
                         }
-                    }
-                    None
-                })
-                .collect()
-        };
-        for script in &scripts {
-            let _ = js_runtime.eval(script);
-        }
-
-        let title = {
-            let d = document.lock().unwrap();
-            page_title(&d)
-        };
-
-        let mut stylesheets = vec![DEFAULT_CSS.to_string()];
-
-        let css_futures: Vec<_> = {
-            let d = document.lock().unwrap();
-            linked_stylesheets(&d, url)
-        }
-            .into_iter()
-            .map(|css_url| {
-                let url = css_url.clone();
-                async move { self.fetch_css(&url).await }
-            })
-            .collect();
-        for result in futures::future::join_all(css_futures).await {
-            if let Ok(css) = result {
-                stylesheets.push(css);
+                        None
+                    })
+                    .collect()
+            };
+            for script in &scripts {
+                let _ = js_runtime.eval(script);
             }
+
+            if let Some(redirect_url) = js_runtime.pending_navigation.lock().unwrap().take() {
+                if let Ok(new_url) = url::Url::parse(&redirect_url) {
+                    current_url = new_url;
+                    continue;
+                }
+            }
+
+            let title = {
+                let d = document.lock().unwrap();
+                page_title(&d)
+            };
+
+            let mut stylesheets = vec![DEFAULT_CSS.to_string()];
+
+            let css_futures: Vec<_> = {
+                let d = document.lock().unwrap();
+                linked_stylesheets(&d, &current_url)
+            }
+                .into_iter()
+                .map(|css_url| {
+                    let url = css_url.clone();
+                    async move { self.fetch_css(&url).await }
+                })
+                .collect();
+            for result in futures::future::join_all(css_futures).await {
+                if let Ok(css) = result {
+                    stylesheets.push(css);
+                }
+            }
+
+            let combined_css = stylesheets.join("\n");
+            let stylesheet = parse_stylesheet(&combined_css)?;
+
+            let (width, height) = (1264.0, 628.0);
+            let (display_list, links) = {
+                let d = document.lock().unwrap();
+                let layout_tree = layout_document(
+                    &d,
+                    &stylesheet,
+                    LayoutConfig {
+                        viewport_width: width,
+                        viewport_height: height,
+                    },
+                )?;
+                let dl = build_display_list_recursive(&d, &layout_tree, &stylesheet, width);
+                let links = extract_links(&d, &layout_tree);
+                (dl, links)
+            };
+
+            return Ok(RenderOutput { display_list, title, links });
         }
-
-        let combined_css = stylesheets.join("\n");
-        let stylesheet = parse_stylesheet(&combined_css)?;
-
-        let (width, height) = (1264.0, 628.0);
-        let (display_list, links) = {
-            let d = document.lock().unwrap();
-            let layout_tree = layout_document(
-                &d,
-                &stylesheet,
-                LayoutConfig {
-                    viewport_width: width,
-                    viewport_height: height,
-                },
-            )?;
-            let dl = build_display_list_recursive(&d, &layout_tree, &stylesheet, width);
-            let links = extract_links(&d, &layout_tree);
-            (dl, links)
-        };
-
-        Ok(RenderOutput { display_list, title, links })
+        Err(PipelineError::RedirectLimit)
     }
 
     async fn fetch_html(&self, url: &Url) -> Result<String, PipelineError> {
