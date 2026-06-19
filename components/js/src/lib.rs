@@ -39,10 +39,16 @@ impl From<BoaJsError> for JsError {
     }
 }
 
+pub struct DomState {
+    pub inline_styles: HashMap<NodeId, HashMap<String, String>>,
+    pub event_listeners: HashMap<NodeId, Vec<(String, BoaValue)>>,
+}
+
 pub struct JsRuntime {
     context: RefCell<Context>,
     document: Arc<Mutex<Document>>,
     pub pending_navigation: Arc<Mutex<Option<String>>>,
+    pub dom_state: Arc<Mutex<DomState>>,
 }
 
 impl JsRuntime {
@@ -52,6 +58,10 @@ impl JsRuntime {
             context: RefCell::new(context),
             document,
             pending_navigation: Arc::new(Mutex::new(None)),
+            dom_state: Arc::new(Mutex::new(DomState {
+                inline_styles: HashMap::new(),
+                event_listeners: HashMap::new(),
+            })),
         };
         rt.init_bindings()?;
         Ok(rt)
@@ -72,6 +82,7 @@ impl JsRuntime {
         let mut ctx = self.context.borrow_mut();
         let doc = self.document.clone();
         let nav_sink = self.pending_navigation.clone();
+        let dom_state = self.dom_state.clone();
 
         let console_log = NativeFunction::from_fn_ptr(|_, args, context| {
             let parts: Vec<String> = args.iter().map(|v| boa_debug_value(v, context)).collect();
@@ -107,7 +118,7 @@ var console = {
         ctx.register_global_callable(JsString::from("__window_location_set_href"), 1, set_href_fn)
             .map_err(|e| JsError::Context(e.to_string()))?;
 
-        let document_obj = build_document_object(&mut ctx, &doc, &self.pending_navigation)?;
+        let document_obj = build_document_object(&mut ctx, &doc, &self.pending_navigation, &dom_state)?;
         ctx.register_global_property(JsString::from("document"), document_obj.clone(), Attribute::all())
             .map_err(|e| JsError::Context(e.to_string()))?;
 
@@ -174,6 +185,7 @@ fn build_document_object(
     ctx: &mut Context,
     doc: &Arc<Mutex<Document>>,
     nav_sink: &Arc<Mutex<Option<String>>>,
+    dom_state: &Arc<Mutex<DomState>>,
 ) -> Result<JsObject, JsError> {
     let document_obj = JsObject::with_null_proto();
 
@@ -227,6 +239,7 @@ fn build_document_object(
     // document.getElementById
     let get_element_by_id = {
         let doc = doc.clone();
+        let dom_state = dom_state.clone();
         unsafe {
             NativeFunction::from_closure(move |_, args, ctx| {
                 let id = args.first()
@@ -234,9 +247,11 @@ fn build_document_object(
                     .map(|s| s.to_std_string_escaped())
                     .unwrap_or_default();
                 let d = doc.lock().unwrap();
-                match find_element_by_id(&d, &id) {
+                let found = find_element_by_id(&d, &id);
+                drop(d);
+                match found {
                     Some(nid) => {
-                        let el = create_element_object(&doc, nid, ctx);
+                        let el = create_element_object(&doc, nid, ctx, &dom_state);
                         Ok(el.map(BoaValue::Object).unwrap_or(BoaValue::Null))
                     }
                     None => Ok(BoaValue::Null),
@@ -251,6 +266,7 @@ fn build_document_object(
     // document.querySelector
     let query_selector = {
         let doc = doc.clone();
+        let dom_state = dom_state.clone();
         unsafe {
             NativeFunction::from_closure(move |_, args, ctx| {
                 let selector = args.first()
@@ -258,9 +274,11 @@ fn build_document_object(
                     .map(|s| s.to_std_string_escaped())
                     .unwrap_or_default();
                 let d = doc.lock().unwrap();
-                match find_element_by_selector(&d, d.root(), &selector) {
+                let found = find_element_by_selector(&d, d.root(), &selector);
+                drop(d);
+                match found {
                     Some(nid) => {
-                        let el = create_element_object(&doc, nid, ctx);
+                        let el = create_element_object(&doc, nid, ctx, &dom_state);
                         Ok(el.map(BoaValue::Object).unwrap_or(BoaValue::Null))
                     }
                     None => Ok(BoaValue::Null),
@@ -275,6 +293,7 @@ fn build_document_object(
     // document.querySelectorAll
     let query_selector_all = {
         let doc = doc.clone();
+        let dom_state = dom_state.clone();
         unsafe {
             NativeFunction::from_closure(move |_, args, ctx| {
                 let selector = args.first()
@@ -282,12 +301,17 @@ fn build_document_object(
                     .map(|s| s.to_std_string_escaped())
                     .unwrap_or_default();
                 let d = doc.lock().unwrap();
-                let mut results: Vec<BoaValue> = Vec::new();
+                let mut matched_ids: Vec<NodeId> = Vec::new();
                 find_all_by_selector(&d, d.root(), &selector, &mut |nid| {
-                    if let Some(el) = create_element_object(&doc, nid, ctx) {
+                    matched_ids.push(nid);
+                });
+                drop(d);
+                let mut results: Vec<BoaValue> = Vec::new();
+                for nid in matched_ids {
+                    if let Some(el) = create_element_object(&doc, nid, ctx, &dom_state) {
                         results.push(BoaValue::Object(el));
                     }
-                });
+                }
                 let nodelist = JsObject::with_null_proto();
                 for (i, val) in results.iter().enumerate() {
                     nodelist.set(i as u32, val.clone(), false, ctx).ok();
@@ -304,6 +328,7 @@ fn build_document_object(
     // document.createElement
     let create_element_fn = {
         let doc = doc.clone();
+        let dom_state = dom_state.clone();
         unsafe {
             NativeFunction::from_closure(move |_, args, ctx| {
                 let tag = args.first()
@@ -317,7 +342,7 @@ fn build_document_object(
                     attributes: Vec::new(),
                 }));
                 drop(d);
-                let el = create_element_object(&doc, nid, ctx);
+                let el = create_element_object(&doc, nid, ctx, &dom_state);
                 Ok(el.map(BoaValue::Object).unwrap_or(BoaValue::Null))
             })
         }
@@ -329,6 +354,7 @@ fn build_document_object(
     // document.createTextNode
     let create_text_node_fn = {
         let doc = doc.clone();
+        let dom_state = dom_state.clone();
         unsafe {
             NativeFunction::from_closure(move |_, args, ctx| {
                 let data = args.first()
@@ -339,7 +365,7 @@ fn build_document_object(
                 let root_id = d.root();
                 let nid = d.append(root_id, NodeKind::Text(data));
                 drop(d);
-                let el = create_element_object(&doc, nid, ctx);
+                let el = create_element_object(&doc, nid, ctx, &dom_state);
                 Ok(el.map(BoaValue::Object).unwrap_or(BoaValue::Null))
             })
         }
@@ -351,12 +377,15 @@ fn build_document_object(
     // document.body
     let body_getter = {
         let doc = doc.clone();
+        let dom_state = dom_state.clone();
         unsafe {
             NativeFunction::from_closure(move |_, _, ctx| {
                 let d = doc.lock().unwrap();
-                match find_element_by_tag(&d, d.root(), "BODY") {
+                let found = find_element_by_tag(&d, d.root(), "BODY");
+                drop(d);
+                match found {
                     Some(nid) => {
-                        let el = create_element_object(&doc, nid, ctx);
+                        let el = create_element_object(&doc, nid, ctx, &dom_state);
                         Ok(el.map(BoaValue::Object).unwrap_or(BoaValue::Null))
                     }
                     None => Ok(BoaValue::Null),
@@ -381,12 +410,15 @@ fn build_document_object(
     // document.head
     let head_getter = {
         let doc = doc.clone();
+        let dom_state = dom_state.clone();
         unsafe {
             NativeFunction::from_closure(move |_, _, ctx| {
                 let d = doc.lock().unwrap();
-                match find_element_by_tag(&d, d.root(), "HEAD") {
+                let found = find_element_by_tag(&d, d.root(), "HEAD");
+                drop(d);
+                match found {
                     Some(nid) => {
-                        let el = create_element_object(&doc, nid, ctx);
+                        let el = create_element_object(&doc, nid, ctx, &dom_state);
                         Ok(el.map(BoaValue::Object).unwrap_or(BoaValue::Null))
                     }
                     None => Ok(BoaValue::Null),
@@ -411,12 +443,15 @@ fn build_document_object(
     // document.documentElement
     let doc_elem_getter = {
         let doc = doc.clone();
+        let dom_state = dom_state.clone();
         unsafe {
             NativeFunction::from_closure(move |_, _, ctx| {
                 let d = doc.lock().unwrap();
-                match find_element_by_tag(&d, d.root(), "HTML") {
+                let found = find_element_by_tag(&d, d.root(), "HTML");
+                drop(d);
+                match found {
                     Some(nid) => {
-                        let el = create_element_object(&doc, nid, ctx);
+                        let el = create_element_object(&doc, nid, ctx, &dom_state);
                         Ok(el.map(BoaValue::Object).unwrap_or(BoaValue::Null))
                     }
                     None => Ok(BoaValue::Null),
@@ -454,6 +489,7 @@ fn create_element_object(
     doc: &Arc<Mutex<Document>>,
     node_id: NodeId,
     ctx: &mut Context,
+    dom_state: &Arc<Mutex<DomState>>,
 ) -> Option<JsObject> {
     let locked = doc.lock().unwrap();
     let node = locked.node(node_id)?;
@@ -582,16 +618,52 @@ fn create_element_object(
                 .name("getAttribute").length(1).build();
             obj.set(JsString::from("getAttribute"), fn_obj, false, ctx).ok();
 
+            // setAttribute
+            let set_attr = {
+                let doc = doc.clone();
+                let nid = node_id;
+                unsafe {
+                    NativeFunction::from_closure(move |_, args, _| {
+                        let name = args.first()
+                            .and_then(|v| v.as_string())
+                            .map(|s| s.to_std_string_escaped())
+                            .unwrap_or_default();
+                        let value = args.get(1)
+                            .and_then(|v| v.as_string())
+                            .map(|s| s.to_std_string_escaped())
+                            .unwrap_or_default();
+                        let mut d = doc.lock().unwrap();
+                        if let Some(n) = d.node_mut(nid) {
+                            if let NodeKind::Element(el) = &mut n.kind {
+                                let existing = el.attributes.iter_mut().find(|a| a.name == name);
+                                if let Some(attr) = existing {
+                                    attr.value = value;
+                                } else {
+                                    el.attributes.push(kore_html::Attribute { name, value });
+                                }
+                            }
+                        }
+                        Ok(BoaValue::Undefined)
+                    })
+                }
+            };
+            let fn_obj = FunctionObjectBuilder::new(ctx.realm(), set_attr)
+                .name("setAttribute").length(2).build();
+            obj.set(JsString::from("setAttribute"), fn_obj, false, ctx).ok();
+
             // parentNode
             let parent_getter = {
                 let doc = doc.clone();
                 let nid = node_id;
+                let ds = dom_state.clone();
                 unsafe {
                     NativeFunction::from_closure(move |_, _, ctx| {
                         let d = doc.lock().unwrap();
-                        match d.node(nid).and_then(|n| n.parent) {
+                        let pid = d.node(nid).and_then(|n| n.parent);
+                        drop(d);
+                        match pid {
                             Some(pid) => {
-                                let el = create_element_object(&doc, pid, ctx);
+                                let el = create_element_object(&doc, pid, ctx, &ds);
                                 Ok(el.map(BoaValue::Object).unwrap_or(BoaValue::Null))
                             }
                             None => Ok(BoaValue::Null),
@@ -615,16 +687,18 @@ fn create_element_object(
             let children_getter = {
                 let doc = doc.clone();
                 let nid = node_id;
+                let ds = dom_state.clone();
                 unsafe {
                     NativeFunction::from_closure(move |_, _, ctx| {
                         let d = doc.lock().unwrap();
                         let children: Vec<NodeId> = d.node(nid)
                             .map(|n| n.children.clone())
                             .unwrap_or_default();
+                        drop(d);
                         let arr = JsObject::with_null_proto();
                         let mut idx = 0usize;
                         for cid in children {
-                            if let Some(el) = create_element_object(&doc, cid, ctx) {
+                            if let Some(el) = create_element_object(&doc, cid, ctx, &ds) {
                                 arr.set(idx as u32, BoaValue::Object(el), false, ctx).ok();
                                 idx += 1;
                             }
@@ -650,12 +724,15 @@ fn create_element_object(
             let first_child_getter = {
                 let doc = doc.clone();
                 let nid = node_id;
+                let ds = dom_state.clone();
                 unsafe {
                     NativeFunction::from_closure(move |_, _, ctx| {
                         let d = doc.lock().unwrap();
-                        match d.node(nid).and_then(|n| n.children.first().copied()) {
+                        let cid = d.node(nid).and_then(|n| n.children.first().copied());
+                        drop(d);
+                        match cid {
                             Some(cid) => {
-                                let el = create_element_object(&doc, cid, ctx);
+                                let el = create_element_object(&doc, cid, ctx, &ds);
                                 Ok(el.map(BoaValue::Object).unwrap_or(BoaValue::Null))
                             }
                             None => Ok(BoaValue::Null),
@@ -679,12 +756,15 @@ fn create_element_object(
             let last_child_getter = {
                 let doc = doc.clone();
                 let nid = node_id;
+                let ds = dom_state.clone();
                 unsafe {
                     NativeFunction::from_closure(move |_, _, ctx| {
                         let d = doc.lock().unwrap();
-                        match d.node(nid).and_then(|n| n.children.last().copied()) {
+                        let cid = d.node(nid).and_then(|n| n.children.last().copied());
+                        drop(d);
+                        match cid {
                             Some(cid) => {
-                                let el = create_element_object(&doc, cid, ctx);
+                                let el = create_element_object(&doc, cid, ctx, &ds);
                                 Ok(el.map(BoaValue::Object).unwrap_or(BoaValue::Null))
                             }
                             None => Ok(BoaValue::Null),
@@ -708,6 +788,7 @@ fn create_element_object(
             let next_sibling_getter = {
                 let doc = doc.clone();
                 let nid = node_id;
+                let ds = dom_state.clone();
                 unsafe {
                     NativeFunction::from_closure(move |_, _, ctx| {
                         let d = doc.lock().unwrap();
@@ -730,7 +811,7 @@ fn create_element_object(
                         if pos + 1 < parent.children.len() {
                             let sid = parent.children[pos + 1];
                             drop(d);
-                            let el = create_element_object(&doc, sid, ctx);
+                            let el = create_element_object(&doc, sid, ctx, &ds);
                             Ok(el.map(BoaValue::Object).unwrap_or(BoaValue::Null))
                         } else {
                             Ok(BoaValue::Null)
@@ -754,6 +835,7 @@ fn create_element_object(
             let prev_sibling_getter = {
                 let doc = doc.clone();
                 let nid = node_id;
+                let ds = dom_state.clone();
                 unsafe {
                     NativeFunction::from_closure(move |_, _, ctx| {
                         let d = doc.lock().unwrap();
@@ -776,7 +858,7 @@ fn create_element_object(
                         if pos > 0 {
                             let sid = parent.children[pos - 1];
                             drop(d);
-                            let el = create_element_object(&doc, sid, ctx);
+                            let el = create_element_object(&doc, sid, ctx, &ds);
                             Ok(el.map(BoaValue::Object).unwrap_or(BoaValue::Null))
                         } else {
                             Ok(BoaValue::Null)
@@ -866,29 +948,208 @@ fn create_element_object(
         }
     }
 
-    let add_el_fn = FunctionObjectBuilder::new(ctx.realm(), NativeFunction::from_fn_ptr(|_, _, _| Ok(BoaValue::Undefined)))
+    // addEventListener
+    let add_el_fn = {
+        let ds = dom_state.clone();
+        let nid = node_id;
+        unsafe {
+            NativeFunction::from_closure(move |_, args, ctx| {
+                let event_type = args.first()
+                    .and_then(|v| v.as_string())
+                    .map(|s| s.to_std_string_escaped())
+                    .unwrap_or_default();
+                let callback = args.get(1).cloned().unwrap_or(BoaValue::Undefined);
+                if !event_type.is_empty() && !callback.is_undefined() {
+                    let mut state = ds.lock().unwrap();
+                    state.event_listeners.entry(nid).or_default().push((event_type, callback));
+                }
+                Ok(BoaValue::Undefined)
+            })
+        }
+    };
+    let add_el_fn = FunctionObjectBuilder::new(ctx.realm(), add_el_fn)
         .name("addEventListener").build();
     obj.set(JsString::from("addEventListener"), add_el_fn, false, ctx).ok();
 
+    // style object with CSS property getters/setters
     let style_obj = JsObject::with_null_proto();
+    let ds = dom_state.clone();
+    let nid = node_id;
+    for (js_name, css_name) in [
+        ("color", "color"),
+        ("backgroundColor", "background-color"),
+        ("display", "display"),
+        ("fontSize", "font-size"),
+        ("fontWeight", "font-weight"),
+    ] {
+        let css_name = css_name.to_string();
+        let ds = ds.clone();
+        let getter = {
+            let ds = ds.clone();
+            let css_name = css_name.clone();
+            unsafe {
+                NativeFunction::from_closure(move |_, _, _| {
+                    let state = ds.lock().unwrap();
+                    let val = state.inline_styles.get(&nid)
+                        .and_then(|m| m.get(&css_name))
+                        .cloned()
+                        .unwrap_or_default();
+                    Ok(BoaValue::String(JsString::from(val)))
+                })
+            }
+        };
+        let setter = {
+            let ds = ds.clone();
+            let css_name = css_name.clone();
+            unsafe {
+                NativeFunction::from_closure(move |_, args, _ctx| {
+                    let val = args.first()
+                        .and_then(|v| v.as_string())
+                        .map(|s| s.to_std_string_escaped())
+                        .unwrap_or_default();
+                    let mut state = ds.lock().unwrap();
+                    state.inline_styles.entry(nid).or_default().insert(css_name.clone(), val);
+                    Ok(BoaValue::Undefined)
+                })
+            }
+        };
+        let getter_obj = FunctionObjectBuilder::new(ctx.realm(), getter)
+            .name(format!("get {js_name}").as_str()).length(0).build();
+        let setter_obj = FunctionObjectBuilder::new(ctx.realm(), setter)
+            .name(format!("set {js_name}").as_str()).length(1).build();
+        style_obj.define_property_or_throw(
+            JsString::from(js_name),
+            PropertyDescriptor::builder()
+                .get(getter_obj).set(setter_obj)
+                .enumerable(true).configurable(true)
+                .build(),
+            ctx,
+        ).ok();
+    }
+    // Keep setProperty for compatibility
     let set_prop_fn = FunctionObjectBuilder::new(ctx.realm(), NativeFunction::from_fn_ptr(|_, _, _| Ok(BoaValue::Undefined)))
         .name("setProperty").build();
     style_obj.set(JsString::from("setProperty"), set_prop_fn, false, ctx).ok();
     obj.set(JsString::from("style"), style_obj, false, ctx).ok();
 
+    // appendChild (stub)
+    let append_child = {
+        unsafe {
+            NativeFunction::from_closure(move |_, args, ctx| {
+                let child = args.first().cloned().unwrap_or(BoaValue::Null);
+                Ok(child)
+            })
+        }
+    };
+    let append_child = FunctionObjectBuilder::new(ctx.realm(), append_child)
+        .name("appendChild").length(1).build();
+    obj.set(JsString::from("appendChild"), append_child, false, ctx).ok();
+
     let class_list_obj = JsObject::with_null_proto();
-    let class_add = FunctionObjectBuilder::new(ctx.realm(), NativeFunction::from_fn_ptr(|_, _, _| Ok(BoaValue::Undefined)))
-        .name("add").build();
-    let class_remove = FunctionObjectBuilder::new(ctx.realm(), NativeFunction::from_fn_ptr(|_, _, _| Ok(BoaValue::Undefined)))
-        .name("remove").build();
-    let class_contains = FunctionObjectBuilder::new(ctx.realm(), NativeFunction::from_fn_ptr(|_, _, _| Ok(BoaValue::Boolean(false))))
-        .name("contains").build();
-    let class_toggle = FunctionObjectBuilder::new(ctx.realm(), NativeFunction::from_fn_ptr(|_, _, _| Ok(BoaValue::Boolean(true))))
-        .name("toggle").build();
-    class_list_obj.set(JsString::from("add"), class_add, false, ctx).ok();
-    class_list_obj.set(JsString::from("remove"), class_remove, false, ctx).ok();
-    class_list_obj.set(JsString::from("contains"), class_contains, false, ctx).ok();
-    class_list_obj.set(JsString::from("toggle"), class_toggle, false, ctx).ok();
+    let class_add = {
+        let doc = doc.clone();
+        let nid = node_id;
+        unsafe {
+            NativeFunction::from_closure(move |_, args, ctx| {
+                let cls = args.first()
+                    .and_then(|v| v.as_string())
+                    .map(|s| s.to_std_string_escaped())
+                    .unwrap_or_default();
+                let mut d = doc.lock().unwrap();
+                if let Some(n) = d.node_mut(nid) {
+                    if let NodeKind::Element(el) = &mut n.kind {
+                        let class_attr = el.attributes.iter_mut().find(|a| a.name == "class");
+                        if let Some(attr) = class_attr {
+                            let classes: Vec<&str> = attr.value.split_whitespace().collect();
+                            if !classes.contains(&cls.as_str()) {
+                                attr.value = if attr.value.is_empty() { cls } else { format!("{} {}", attr.value, cls) };
+                            }
+                        } else {
+                            el.attributes.push(kore_html::Attribute { name: "class".to_string(), value: cls });
+                        }
+                    }
+                }
+                Ok(BoaValue::Undefined)
+            })
+        }
+    };
+    let class_remove = {
+        let doc = doc.clone();
+        let nid = node_id;
+        unsafe {
+            NativeFunction::from_closure(move |_, args, ctx| {
+                let cls = args.first()
+                    .and_then(|v| v.as_string())
+                    .map(|s| s.to_std_string_escaped())
+                    .unwrap_or_default();
+                let mut d = doc.lock().unwrap();
+                if let Some(n) = d.node_mut(nid) {
+                    if let NodeKind::Element(el) = &mut n.kind {
+                        if let Some(attr) = el.attributes.iter_mut().find(|a| a.name == "class") {
+                            let new_classes: Vec<&str> = attr.value.split_whitespace().filter(|c| *c != cls).collect();
+                            attr.value = new_classes.join(" ");
+                        }
+                    }
+                }
+                Ok(BoaValue::Undefined)
+            })
+        }
+    };
+    let class_contains = {
+        let doc = doc.clone();
+        let nid = node_id;
+        unsafe {
+            NativeFunction::from_closure(move |_, args, ctx| {
+                let cls = args.first()
+                    .and_then(|v| v.as_string())
+                    .map(|s| s.to_std_string_escaped())
+                    .unwrap_or_default();
+                let d = doc.lock().unwrap();
+                let found = d.node(nid).and_then(|n| match &n.kind {
+                    NodeKind::Element(el) => el.attributes.iter()
+                        .find(|a| a.name == "class")
+                        .map(|a| a.value.split_whitespace().any(|c| c == cls)),
+                    _ => None,
+                }).unwrap_or(false);
+                Ok(BoaValue::Boolean(found))
+            })
+        }
+    };
+    let class_toggle = {
+        let doc = doc.clone();
+        let nid = node_id;
+        unsafe {
+            NativeFunction::from_closure(move |_, args, ctx| {
+                let cls = args.first()
+                    .and_then(|v| v.as_string())
+                    .map(|s| s.to_std_string_escaped())
+                    .unwrap_or_default();
+                let mut d = doc.lock().unwrap();
+                if let Some(n) = d.node_mut(nid) {
+                    if let NodeKind::Element(el) = &mut n.kind {
+                        if let Some(attr) = el.attributes.iter_mut().find(|a| a.name == "class") {
+                            let classes: Vec<&str> = attr.value.split_whitespace().collect();
+                            if classes.contains(&cls.as_str()) {
+                                let new_classes: Vec<&str> = classes.into_iter().filter(|c| *c != cls).collect();
+                                attr.value = new_classes.join(" ");
+                            } else {
+                                attr.value = if attr.value.is_empty() { cls.clone() } else { format!("{} {}", attr.value, cls) };
+                            }
+                        } else {
+                            el.attributes.push(kore_html::Attribute { name: "class".to_string(), value: cls.clone() });
+                        }
+                        drop(d);
+                        return Ok(BoaValue::Boolean(true));
+                    }
+                }
+                Ok(BoaValue::Boolean(false))
+            })
+        }
+    };
+    class_list_obj.set(JsString::from("add"), FunctionObjectBuilder::new(ctx.realm(), class_add).name("add").build(), false, ctx).ok();
+    class_list_obj.set(JsString::from("remove"), FunctionObjectBuilder::new(ctx.realm(), class_remove).name("remove").build(), false, ctx).ok();
+    class_list_obj.set(JsString::from("contains"), FunctionObjectBuilder::new(ctx.realm(), class_contains).name("contains").build(), false, ctx).ok();
+    class_list_obj.set(JsString::from("toggle"), FunctionObjectBuilder::new(ctx.realm(), class_toggle).name("toggle").build(), false, ctx).ok();
     obj.set(JsString::from("classList"), class_list_obj, false, ctx).ok();
 
     obj.set(JsString::from("dataset"), JsObject::with_null_proto(), false, ctx).ok();
@@ -1496,6 +1757,119 @@ xhr.readyState;
         let rt = JsRuntime::new(make_doc())?;
         let result = rt.eval("var p = fetch('/test'); typeof p.then")?;
         assert_eq!(result, QJsValue::String("function".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn query_selector_finds_by_id() -> Result<(), JsError> {
+        let rt = JsRuntime::new(make_doc())?;
+        rt.eval(r#"
+            var el = document.createElement('div');
+            el.setAttribute('id', 'test-id');
+            document.getElementById('test-id');
+        "#)?;
+        let result = rt.eval(r#"document.querySelector('#test-id') !== null"#)?;
+        assert_eq!(result, QJsValue::Bool(true));
+        Ok(())
+    }
+
+    #[test]
+    fn query_selector_finds_by_tag() -> Result<(), JsError> {
+        let rt = JsRuntime::new(make_doc())?;
+        rt.eval(r#"
+            var el = document.createElement('span');
+            el.setAttribute('id', 'span-1');
+        "#)?;
+        let result = rt.eval(r#"document.querySelector('span') !== null"#)?;
+        assert_eq!(result, QJsValue::Bool(true));
+        Ok(())
+    }
+
+    #[test]
+    fn get_attribute_set_attribute_roundtrip() -> Result<(), JsError> {
+        let rt = JsRuntime::new(make_doc())?;
+        rt.eval(r#"
+            var el = document.createElement('div');
+            el.setAttribute('data-test', 'hello');
+        "#)?;
+        let result = rt.eval(r#"
+            var el = document.querySelector('div');
+            el.getAttribute('data-test');
+        "#)?;
+        assert_eq!(result, QJsValue::String("hello".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn class_list_add_remove_contains() -> Result<(), JsError> {
+        let rt = JsRuntime::new(make_doc())?;
+        rt.eval(r#"
+            var el = document.createElement('div');
+            el.classList.add('foo');
+            el.classList.add('bar');
+        "#)?;
+        let result = rt.eval(r#"
+            var el = document.querySelector('div');
+            el.classList.contains('foo') && el.classList.contains('bar')
+        "#)?;
+        assert_eq!(result, QJsValue::Bool(true));
+        let result = rt.eval(r#"
+            var el = document.querySelector('div');
+            el.classList.remove('foo');
+            el.classList.contains('foo');
+        "#)?;
+        assert_eq!(result, QJsValue::Bool(false));
+        Ok(())
+    }
+
+    #[test]
+    fn add_event_listener_does_not_crash() -> Result<(), JsError> {
+        let rt = JsRuntime::new(make_doc())?;
+        let result = rt.eval(r#"
+            var el = document.createElement('div');
+            el.addEventListener('click', function() { return 42; });
+            'ok';
+        "#)?;
+        assert_eq!(result, QJsValue::String("ok".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn style_color_get_set_roundtrip() -> Result<(), JsError> {
+        let rt = JsRuntime::new(make_doc())?;
+        rt.eval(r#"
+            var el = document.createElement('div');
+            el.style.color = 'red';
+        "#)?;
+        let result = rt.eval(r#"
+            var el = document.querySelector('div');
+            el.style.color;
+        "#)?;
+        assert_eq!(result, QJsValue::String("red".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn create_element_returns_valid_object() -> Result<(), JsError> {
+        let rt = JsRuntime::new(make_doc())?;
+        let result = rt.eval(r#"
+            var el = document.createElement('div');
+            el.tagName;
+        "#)?;
+        assert_eq!(result, QJsValue::String("DIV".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn append_child_does_not_crash() -> Result<(), JsError> {
+        let rt = JsRuntime::new(make_doc())?;
+        let result = rt.eval(r#"
+            var parent = document.createElement('div');
+            var child = document.createElement('span');
+            var returned = parent.appendChild(child);
+            returned.tagName;
+        "#)?;
+        assert_eq!(result, QJsValue::String("SPAN".to_string()));
         Ok(())
     }
 }

@@ -288,13 +288,7 @@ fn traverse_node(
     let Some(node) = document.node(dom_id) else { return };
     match &node.kind {
         NodeKind::Element(el) => {
-            let display = if let Some(ln) = layout_tree.nodes.iter().find(|n| n.dom_node_id == Some(dom_id)) {
-                ln.style.display
-            } else {
-                default_display_for_tag(&el.tag_name)
-            };
-
-            if display == Display::None {
+            if default_display_for_tag(&el.tag_name) == Display::None {
                 return;
             }
 

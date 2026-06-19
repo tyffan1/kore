@@ -66,6 +66,10 @@ impl Document {
         self.nodes.get(id.0)
     }
 
+    pub fn node_mut(&mut self, id: NodeId) -> Option<&mut Node> {
+        self.nodes.get_mut(id.0)
+    }
+
     pub fn append(&mut self, parent: NodeId, kind: NodeKind) -> NodeId {
         let id = NodeId(self.nodes.len());
         self.nodes.push(Node {
