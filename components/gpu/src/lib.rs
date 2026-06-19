@@ -14,8 +14,8 @@ mod vertex;
 mod tests;
 
 pub use atlas::TextureAtlas;
-pub use display_list::{ClipRect, Color, DisplayCommand, DisplayList, DrawImage, DrawRect, DrawText};
+pub use display_list::{ClipRect, Color, DisplayCommand, DisplayList, DrawCircle, DrawImage, DrawRect, DrawText};
 pub use error::GpuError;
-pub use pipeline::{RectPipeline, TextPipeline};
+pub use pipeline::{CirclePipeline, RectPipeline, TextPipeline};
 pub use renderer::{FrameRenderer, Renderer, RendererConfig};
-pub use vertex::{rect_vertices, text_quad_vertices, TextVertex, Vertex, RECT_INDICES};
+pub use vertex::{circle_quad_vertices, rect_vertices, text_quad_vertices, CircleVertex, TextVertex, Vertex, RECT_INDICES};

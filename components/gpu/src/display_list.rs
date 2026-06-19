@@ -57,6 +57,14 @@ pub struct DrawImage {
     pub atlas_id: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DrawCircle {
+    pub cx: f32,
+    pub cy: f32,
+    pub radius: f32,
+    pub color: Color,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ClipRect {
     pub x: f32,
@@ -83,6 +91,7 @@ pub enum DisplayCommand {
     Rect(DrawRect),
     Text(DrawText),
     Image(DrawImage),
+    Circle(DrawCircle),
     PushClip(ClipRect),
     PopClip,
 }
@@ -111,6 +120,10 @@ impl DisplayList {
 
     pub fn push_image(&mut self, image: DrawImage) {
         self.commands.push(DisplayCommand::Image(image));
+    }
+
+    pub fn push_circle(&mut self, circle: DrawCircle) {
+        self.commands.push(DisplayCommand::Circle(circle));
     }
 
     pub fn push_clip(&mut self, clip: ClipRect) {

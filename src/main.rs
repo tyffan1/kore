@@ -6,8 +6,9 @@ use std::time::Instant;
 use clipboard::ClipboardProvider;
 use kore_browser::BrowserApp;
 use kore_devtools::DevTools;
-use kore_gpu::{ClipRect, Color, DisplayCommand, DisplayList, DrawRect, DrawText, Renderer, RendererConfig};
+use kore_gpu::{ClipRect, Color, DisplayCommand, DisplayList, DrawCircle, DrawRect, DrawText, Renderer, RendererConfig};
 use kore_pipeline::{Pipeline, RenderOutput};
+use kore_ui::WindowControlsStyle;
 use kore_window::{AppEvent, EventLoop, InputEvent, Key, Modifiers, MouseButton, WindowBuilder, WindowHandle};
 
 const SEARCH_ENGINES: &[(&str, &str)] = &[
@@ -47,6 +48,7 @@ struct AppState {
     render_tx: mpsc::SyncSender<RenderOutput>,
     render_rx: mpsc::Receiver<RenderOutput>,
     devtools: DevTools,
+    focused: bool,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -104,6 +106,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         render_tx: tx,
         render_rx: rx,
         devtools: DevTools::new(),
+        focused: true,
     });
 
     let renderer = RefCell::new(None::<Renderer>);
@@ -208,7 +211,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 elwt.exit();
             }
 
-            _ => {}
+            AppEvent::FocusChanged(focused) => {
+                state.borrow_mut().focused = focused;
+                if let Some(ref w) = state.borrow().window {
+                    w.request_redraw();
+                }
+            }
         }
     });
 }
@@ -284,10 +292,31 @@ fn update_hover_states(state: &mut AppState) {
     state.forward_button_hover = x >= 42.0 && x <= 70.0 && y >= 36.0 && y <= 72.0;
     state.reload_button_hover = x >= 76.0 && x <= 104.0 && y >= 36.0 && y <= 72.0;
 
-    // Window control button hover (titlebar, y < 36)
-    state.min_btn_hover = y < 36.0 && x >= w - 108.0 && x <= w - 72.0;
-    state.max_btn_hover = y < 36.0 && x >= w - 72.0 && x <= w - 36.0;
-    state.close_btn_hover = y < 36.0 && x >= w - 36.0 && x <= w;
+    if y < 36.0 {
+        match WindowControlsStyle::current() {
+            WindowControlsStyle::MacOS => {
+                let in_group = x >= 10.0 && x <= 82.0 && y >= 10.0 && y <= 26.0;
+                if in_group {
+                    state.close_btn_hover = (x - 18.0).powi(2) + (y - 18.0).powi(2) <= 64.0;
+                    state.min_btn_hover = (x - 42.0).powi(2) + (y - 18.0).powi(2) <= 64.0;
+                    state.max_btn_hover = (x - 66.0).powi(2) + (y - 18.0).powi(2) <= 64.0;
+                } else {
+                    state.close_btn_hover = false;
+                    state.min_btn_hover = false;
+                    state.max_btn_hover = false;
+                }
+            }
+            WindowControlsStyle::Windows | WindowControlsStyle::Linux => {
+                state.min_btn_hover = x >= w - 138.0 && x <= w - 92.0;
+                state.max_btn_hover = x >= w - 92.0 && x <= w - 46.0;
+                state.close_btn_hover = x >= w - 46.0 && x <= w;
+            }
+        }
+    } else {
+        state.close_btn_hover = false;
+        state.min_btn_hover = false;
+        state.max_btn_hover = false;
+    }
 }
 
 fn handle_mouse_click(state: &mut AppState, x: f64, y: f64) {
@@ -295,29 +324,56 @@ fn handle_mouse_click(state: &mut AppState, x: f64, y: f64) {
 
     // ── Row 1: Titlebar + Tab bar (y < 36) ──
     if y < 36.0 {
-        // Window control buttons (right side)
-        if x >= w - 36.0 && x <= w {
-            // Close
-            let _ = state.browser.shutdown();
-            std::process::exit(0);
-        }
-        if x >= w - 72.0 && x <= w - 36.0 {
-            // Maximize / Restore toggle
-            if let Some(ref win) = state.window {
-                let is_max = win.is_maximized();
-                win.set_maximized(!is_max);
+        match WindowControlsStyle::current() {
+            WindowControlsStyle::MacOS => {
+                if (x - 18.0).powi(2) + (y - 18.0).powi(2) <= 64.0 {
+                    let _ = state.browser.shutdown();
+                    std::process::exit(0);
+                }
+                if (x - 66.0).powi(2) + (y - 18.0).powi(2) <= 64.0 {
+                    if let Some(ref win) = state.window {
+                        let is_max = win.is_maximized();
+                        win.set_maximized(!is_max);
+                    }
+                    return;
+                }
+                if (x - 42.0).powi(2) + (y - 18.0).powi(2) <= 64.0 {
+                    if let Some(ref win) = state.window {
+                        win.set_minimized(true);
+                    }
+                    return;
+                }
             }
-            return;
-        }
-        if x >= w - 108.0 && x <= w - 72.0 {
-            // Minimize
-            if let Some(ref win) = state.window {
-                win.set_minimized(true);
+            WindowControlsStyle::Windows | WindowControlsStyle::Linux => {
+                if x >= w - 46.0 && x <= w {
+                    let _ = state.browser.shutdown();
+                    std::process::exit(0);
+                }
+                if x >= w - 92.0 && x <= w - 46.0 {
+                    if let Some(ref win) = state.window {
+                        let is_max = win.is_maximized();
+                        win.set_maximized(!is_max);
+                    }
+                    return;
+                }
+                if x >= w - 138.0 && x <= w - 92.0 {
+                    if let Some(ref win) = state.window {
+                        win.set_minimized(true);
+                    }
+                    return;
+                }
             }
-            return;
         }
 
-        let tab_start_x = 32.0;
+        let style = WindowControlsStyle::current();
+        let tab_start_x: f32 = match style {
+            WindowControlsStyle::MacOS => 80.0,
+            _ => 32.0,
+        };
+        let right_margin: f64 = match style {
+            WindowControlsStyle::MacOS => 36.0,
+            _ => 174.0, // 46×3 + 36 (new tab button)
+        };
         let tabs = state.browser.list_tabs().to_vec();
 
         // Tab clicks
@@ -349,8 +405,8 @@ fn handle_mouse_click(state: &mut AppState, x: f64, y: f64) {
             }
         }
 
-        // New tab button (before window controls)
-        let new_tab_x = ((tab_start_x + (tabs.len() as f32) * 180.0) as f64).min(w - 144.0);
+        // New tab button
+        let new_tab_x = ((tab_start_x + (tabs.len() as f32) * 180.0) as f64).min(w - right_margin);
         if x >= new_tab_x && x <= new_tab_x + 36.0 && y >= 0.0 && y <= 36.0 {
             if let Ok(url) = url::Url::parse("about:blank") {
                 if state.browser.open_tab(url).is_ok() {
@@ -787,15 +843,68 @@ fn navigate(state: &mut AppState, mut url: url::Url) {
     });
 }
 
-fn draw_titlebar(list: &mut DisplayList, tabs: &[kore_browser::Tab], page_title: Option<&str>, w: f32, min_hov: bool, max_hov: bool, close_hov: bool) {
-    let tab_start = 32.0;
-    list.push_rect(DrawRect { x: 0.0, y: 0.0, width: w, height: 36.0, color: Color::from_rgba8(30, 30, 42, 255) });
-    list.push_rect(DrawRect { x: 8.0, y: 10.0, width: 16.0, height: 16.0, color: Color::from_rgba8(100, 100, 110, 255) });
+fn draw_titlebar(list: &mut DisplayList, tabs: &[kore_browser::Tab], page_title: Option<&str>, w: f32, min_hov: bool, max_hov: bool, close_hov: bool, focused: bool) {
+    let style = WindowControlsStyle::current();
+    let tab_start: f32 = match style {
+        WindowControlsStyle::MacOS => 80.0,
+        _ => 32.0,
+    };
+    let right_margin: f32 = match style {
+        WindowControlsStyle::MacOS => 36.0,
+        _ => 174.0, // 46×3 + 36 (new tab button)
+    };
+    list.push_rect(DrawRect { x: 0.0, y: 0.0, width: w, height: 36.0, color: Color::from_rgba8(26, 26, 36, 255) });
+
+    match style {
+        WindowControlsStyle::MacOS => {
+            let gray = Color::from_rgba8(0x9E, 0x9E, 0x9E, 255);
+            let close_color = if focused { Color::from_rgba8(0xFF, 0x5F, 0x56, 255) } else { gray };
+            let min_color = if focused { Color::from_rgba8(0xFF, 0xBD, 0x2E, 255) } else { gray };
+            let max_color = if focused { Color::from_rgba8(0x27, 0xC9, 0x3F, 255) } else { gray };
+
+            list.push_circle(DrawCircle { cx: 18.0, cy: 18.0, radius: 8.0, color: close_color });
+            list.push_circle(DrawCircle { cx: 42.0, cy: 18.0, radius: 8.0, color: min_color });
+            list.push_circle(DrawCircle { cx: 66.0, cy: 18.0, radius: 8.0, color: max_color });
+
+            let hovered = (close_hov || min_hov || max_hov) && focused;
+            if hovered {
+                let close_icon = Color::from_rgba8(100, 20, 20, 204);
+                list.push_rect(DrawRect { x: 15.0, y: 11.0, width: 1.5, height: 8.0, color: close_icon });
+                list.push_rect(DrawRect { x: 15.0, y: 11.0, width: 8.0, height: 1.5, color: close_icon });
+
+                let min_icon = Color::from_rgba8(80, 50, 0, 204);
+                list.push_rect(DrawRect { x: 38.0, y: 15.25, width: 8.0, height: 1.5, color: min_icon });
+
+                let max_icon = Color::from_rgba8(0, 60, 20, 204);
+                list.push_rect(DrawRect { x: 62.0, y: 11.0, width: 6.0, height: 1.5, color: max_icon });
+                list.push_rect(DrawRect { x: 62.0, y: 11.0, width: 1.5, height: 6.0, color: max_icon });
+                list.push_rect(DrawRect { x: 66.5, y: 15.5, width: 6.0, height: 1.5, color: max_icon });
+                list.push_rect(DrawRect { x: 66.5, y: 15.5, width: 1.5, height: 6.0, color: max_icon });
+            }
+        }
+        WindowControlsStyle::Windows | WindowControlsStyle::Linux => {
+            let min_bg = if min_hov { Color::from_rgba8(0xE5, 0xE5, 0xE5, 255) } else { Color::TRANSPARENT };
+            list.push_rect(DrawRect { x: w - 138.0, y: 0.0, width: 46.0, height: 36.0, color: min_bg });
+            list.push_text(DrawText { x: w - 121.0, y: 11.0, text: "\u{2212}".to_string(), font_size: 14.0, color: Color::WHITE, font_family: Some("sans-serif".to_string()), bold: false, italic: false });
+
+            let max_bg = if max_hov { Color::from_rgba8(0xE5, 0xE5, 0xE5, 255) } else { Color::TRANSPARENT };
+            list.push_rect(DrawRect { x: w - 92.0, y: 0.0, width: 46.0, height: 36.0, color: max_bg });
+            list.push_text(DrawText { x: w - 75.0, y: 11.0, text: "\u{25A1}".to_string(), font_size: 14.0, color: Color::WHITE, font_family: Some("sans-serif".to_string()), bold: false, italic: false });
+
+            let close_bg = if close_hov { Color::from_rgba8(0xC4, 0x2B, 0x1C, 255) } else { Color::TRANSPARENT };
+            list.push_rect(DrawRect { x: w - 46.0, y: 0.0, width: 46.0, height: 36.0, color: close_bg });
+            list.push_text(DrawText { x: w - 29.0, y: 11.0, text: "\u{00D7}".to_string(), font_size: 14.0, color: Color::WHITE, font_family: Some("sans-serif".to_string()), bold: false, italic: false });
+        }
+    }
 
     for (i, tab) in tabs.iter().enumerate() {
         let tx = tab_start + (i as f32) * 180.0;
-        let tab_color = if tab.is_active { Color::from_rgba8(45, 45, 58, 255) } else { Color::from_rgba8(30, 30, 42, 255) };
-        list.push_rect(DrawRect { x: tx, y: 0.0, width: 170.0, height: 36.0, color: tab_color });
+        let tab_color = if tab.is_active { Color::from_rgba8(45, 45, 61, 255) } else { Color::from_rgba8(26, 26, 36, 255) };
+        if tab.is_active {
+            list.push_rect(DrawRect { x: tx + 1.0, y: 1.0, width: 168.0, height: 35.0, color: tab_color });
+        } else {
+            list.push_rect(DrawRect { x: tx, y: 0.0, width: 170.0, height: 36.0, color: tab_color });
+        }
         let title: String = if tab.is_active && page_title.is_some() {
             page_title.unwrap().chars().take(20).collect()
         } else if tab.url.as_str() == "about:blank" { "New Tab".to_string() } else { tab.url.as_str().chars().take(20).collect() };
@@ -803,39 +912,32 @@ fn draw_titlebar(list: &mut DisplayList, tabs: &[kore_browser::Tab], page_title:
         list.push_text(DrawText { x: tx + 150.0, y: 11.0, text: "×".to_string(), font_size: 13.0, color: Color::from_rgba8(180, 180, 190, 255), font_family: Some("sans-serif".to_string()), bold: false, italic: false });
     }
 
-    let new_tab_x = (tab_start + (tabs.len() as f32) * 180.0).min(w - 144.0);
-    list.push_rect(DrawRect { x: new_tab_x, y: 0.0, width: 36.0, height: 36.0, color: Color::from_rgba8(30, 30, 42, 255) });
+    let new_tab_x = (tab_start + (tabs.len() as f32) * 180.0).min(w - right_margin);
+    list.push_rect(DrawRect { x: new_tab_x, y: 0.0, width: 36.0, height: 36.0, color: Color::from_rgba8(26, 26, 36, 255) });
     list.push_text(DrawText { x: new_tab_x + 11.0, y: 11.0, text: "+".to_string(), font_size: 14.0, color: Color::WHITE, font_family: Some("sans-serif".to_string()), bold: false, italic: false });
-
-    let min_bg = if min_hov { Color::from_rgba8(55, 55, 70, 255) } else { Color::from_rgba8(30, 30, 42, 255) };
-    list.push_rect(DrawRect { x: w - 108.0, y: 0.0, width: 36.0, height: 36.0, color: min_bg });
-    list.push_text(DrawText { x: w - 96.0, y: 11.0, text: "\u{2212}".to_string(), font_size: 14.0, color: Color::WHITE, font_family: Some("sans-serif".to_string()), bold: false, italic: false });
-
-    let max_bg = if max_hov { Color::from_rgba8(55, 55, 70, 255) } else { Color::from_rgba8(30, 30, 42, 255) };
-    list.push_rect(DrawRect { x: w - 72.0, y: 0.0, width: 36.0, height: 36.0, color: max_bg });
-    list.push_text(DrawText { x: w - 60.0, y: 11.0, text: "\u{25A1}".to_string(), font_size: 14.0, color: Color::WHITE, font_family: Some("sans-serif".to_string()), bold: false, italic: false });
-
-    let close_bg = if close_hov { Color::from_rgba8(0xE8, 0x11, 0x23, 255) } else { Color::from_rgba8(30, 30, 42, 255) };
-    list.push_rect(DrawRect { x: w - 36.0, y: 0.0, width: 36.0, height: 36.0, color: close_bg });
-    list.push_text(DrawText { x: w - 24.0, y: 11.0, text: "\u{00D7}".to_string(), font_size: 14.0, color: Color::WHITE, font_family: Some("sans-serif".to_string()), bold: false, italic: false });
 }
 
 fn draw_navbar(list: &mut DisplayList, w: f32, back_hov: bool, fwd_hov: bool, rld_hov: bool, loading: bool, url_text: String, is_secure: bool, cursor_pos: usize, selection_start: Option<usize>, cursor_visible: bool, address_bar_focused: bool) {
     list.push_rect(DrawRect { x: 0.0, y: 36.0, width: w, height: 36.0, color: Color::from_rgba8(40, 40, 58, 255) });
+    list.push_rect(DrawRect { x: 0.0, y: 36.0, width: w, height: 1.0, color: Color::from_rgba8(0, 0, 0, 51) });
 
-    let back_bg = if back_hov { Color::from_rgba8(74, 74, 79, 255) } else { Color::from_rgba8(58, 58, 63, 255) };
+    let hover_bright = Color::from_rgba8(88, 88, 100, 255);
+    let btn_base = Color::from_rgba8(58, 58, 63, 255);
+
+    let back_bg = if back_hov { hover_bright } else { btn_base };
     list.push_rect(DrawRect { x: 8.0, y: 40.0, width: 28.0, height: 28.0, color: back_bg });
     list.push_text(DrawText { x: 14.0, y: 48.0, text: "<".to_string(), font_size: 14.0, color: Color::WHITE, font_family: Some("sans-serif".to_string()), bold: false, italic: false });
 
-    let fwd_bg = if fwd_hov { Color::from_rgba8(74, 74, 79, 255) } else { Color::from_rgba8(58, 58, 63, 255) };
+    let fwd_bg = if fwd_hov { hover_bright } else { btn_base };
     list.push_rect(DrawRect { x: 42.0, y: 40.0, width: 28.0, height: 28.0, color: fwd_bg });
     list.push_text(DrawText { x: 48.0, y: 48.0, text: ">".to_string(), font_size: 14.0, color: Color::WHITE, font_family: Some("sans-serif".to_string()), bold: false, italic: false });
 
-    let rld_bg = if rld_hov { Color::from_rgba8(74, 74, 79, 255) } else { Color::from_rgba8(58, 58, 63, 255) };
+    let rld_bg = if rld_hov { hover_bright } else { btn_base };
     list.push_rect(DrawRect { x: 76.0, y: 40.0, width: 28.0, height: 28.0, color: rld_bg });
     list.push_text(DrawText { x: 80.0, y: 48.0, text: "R".to_string(), font_size: 14.0, color: Color::WHITE, font_family: Some("sans-serif".to_string()), bold: false, italic: false });
 
-    list.push_rect(DrawRect { x: 110.0, y: 40.0, width: w - 120.0, height: 28.0, color: Color::from_rgba8(245, 245, 245, 255) });
+    list.push_rect(DrawRect { x: 110.0, y: 40.0, width: w - 120.0, height: 28.0, color: Color::from_rgba8(210, 210, 215, 255) });
+    list.push_rect(DrawRect { x: 112.0, y: 42.0, width: w - 124.0, height: 24.0, color: Color::from_rgba8(255, 255, 255, 255) });
     draw_address_bar(list, url_text, is_secure, address_bar_focused, cursor_pos, selection_start, cursor_visible);
 
     if loading {
@@ -856,6 +958,7 @@ fn build_display_list(state: &mut AppState) {
     let max_hov = state.max_btn_hover;
     let min_hov = state.min_btn_hover;
     let loading = state.loading;
+    let focused = state.focused;
 
     let url_text = if state.address_bar_focused {
         state.url_buffer.clone()
@@ -879,7 +982,7 @@ fn build_display_list(state: &mut AppState) {
     list.push_rect(DrawRect { x: 0.0, y: 0.0, width, height, color: Color::from_rgba8(240, 240, 245, 255) });
 
     // Row 1 - Titlebar + Tabs (y=0..36)
-    draw_titlebar(list, &tabs, page_title, width, min_hov, max_hov, close_hov);
+    draw_titlebar(list, &tabs, page_title, width, min_hov, max_hov, close_hov, focused);
 
     // Row 2 - Navigation + Address bar (y=36..72)
     draw_navbar(list, width, back_hov, fwd_hov, rld_hov, loading, url_text.clone(), is_secure, cursor_pos, selection_start, cursor_visible, address_bar_focused);
@@ -926,7 +1029,7 @@ fn build_display_list(state: &mut AppState) {
 
     // Mask header (y=0..72) to cover any content overflow, then redraw UI
     list.push_rect(DrawRect { x: 0.0, y: 0.0, width, height: 72.0, color: Color::from_rgba8(240, 240, 245, 255) });
-    draw_titlebar(list, &tabs, page_title, width, min_hov, max_hov, close_hov);
+    draw_titlebar(list, &tabs, page_title, width, min_hov, max_hov, close_hov, focused);
     draw_navbar(list, width, back_hov, fwd_hov, rld_hov, loading, url_text, is_secure, cursor_pos, selection_start, cursor_visible, address_bar_focused);
 
     // Scrollbar
@@ -962,17 +1065,17 @@ fn draw_address_bar(
     cursor_visible: bool,
 ) {
     let font_size = 14.0;
-    let text_x = 126.0;
+    let text_x = 128.0;
     let text_y = 48.0;
 
-    // Security indicator: colored dot
-    let (dot_color, dot_border) = if is_secure {
-        (Color::from_rgba8(0, 180, 0, 255), Color::from_rgba8(0, 130, 0, 255))
+    // Security indicator: colored dot with white border ring
+    let dot_color = if is_secure {
+        Color::from_rgba8(0, 180, 0, 255)
     } else {
-        (Color::from_rgba8(200, 80, 60, 255), Color::from_rgba8(180, 60, 40, 255))
+        Color::from_rgba8(200, 80, 60, 255)
     };
-    list.push_rect(DrawRect { x: 116.0, y: 50.0, width: 10.0, height: 10.0, color: dot_border });
-    list.push_rect(DrawRect { x: 118.0, y: 52.0, width: 6.0, height: 6.0, color: dot_color });
+    list.push_rect(DrawRect { x: 115.0, y: 49.0, width: 12.0, height: 12.0, color: Color::from_rgba8(255, 255, 255, 220) });
+    list.push_rect(DrawRect { x: 117.0, y: 51.0, width: 8.0, height: 8.0, color: dot_color });
 
     let is_empty = url_text.is_empty();
     let display_text = if is_empty && !focused {

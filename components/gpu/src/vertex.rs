@@ -59,6 +59,40 @@ impl TextVertex {
     };
 }
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct CircleVertex {
+    pub position: [f32; 2],
+    pub color: [f32; 4],
+    pub center: [f32; 2],
+    pub radius: f32,
+}
+
+impl CircleVertex {
+    pub const LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<CircleVertex>() as wgpu::BufferAddress,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &[
+            wgpu::VertexAttribute { offset: 0, shader_location: 0, format: wgpu::VertexFormat::Float32x2 },
+            wgpu::VertexAttribute { offset: 8, shader_location: 1, format: wgpu::VertexFormat::Float32x4 },
+            wgpu::VertexAttribute { offset: 24, shader_location: 2, format: wgpu::VertexFormat::Float32x2 },
+            wgpu::VertexAttribute { offset: 32, shader_location: 3, format: wgpu::VertexFormat::Float32 },
+        ],
+    };
+}
+
+pub fn circle_quad_vertices(cx: f32, cy: f32, radius: f32, color: [f32; 4]) -> [CircleVertex; 4] {
+    let x = cx - radius;
+    let y = cy - radius;
+    let s = 2.0 * radius;
+    [
+        CircleVertex { position: [x, y], color, center: [cx, cy], radius },
+        CircleVertex { position: [x + s, y], color, center: [cx, cy], radius },
+        CircleVertex { position: [x, y + s], color, center: [cx, cy], radius },
+        CircleVertex { position: [x + s, y + s], color, center: [cx, cy], radius },
+    ]
+}
+
 pub fn rect_vertices(x: f32, y: f32, w: f32, h: f32, color: [f32; 4]) -> [Vertex; 4] {
     [
         Vertex { position: [x, y], color },

@@ -7,8 +7,8 @@ use wgpu::util::DeviceExt;
 use crate::{
     display_list::{DisplayCommand, DisplayList},
     error::GpuError,
-    pipeline::{RectPipeline, TextPipeline},
-    vertex::{rect_vertices, text_quad_vertices, TextVertex, Vertex, RECT_INDICES},
+    pipeline::{CirclePipeline, RectPipeline, TextPipeline},
+    vertex::{circle_quad_vertices, rect_vertices, text_quad_vertices, CircleVertex, TextVertex, Vertex, RECT_INDICES},
 };
 
 use kore_font::{FontCache, FontDescription, FontId};
@@ -36,6 +36,7 @@ pub struct Renderer {
     pub surface: wgpu::Surface<'static>,
     pub surface_config: wgpu::SurfaceConfiguration,
     rect_pipeline: RectPipeline,
+    circle_pipeline: CirclePipeline,
     text_pipeline: TextPipeline,
     viewport_buffer: wgpu::Buffer,
     viewport_bind_group: wgpu::BindGroup,
@@ -95,6 +96,7 @@ impl Renderer {
         surface.configure(&device, &surface_config);
 
         let rect_pipeline = RectPipeline::new(&device, surface_format);
+        let circle_pipeline = CirclePipeline::new(&device, surface_format, &rect_pipeline.viewport_bind_group_layout);
         let text_pipeline = TextPipeline::new(&device, surface_format);
 
         let viewport_data: [f32; 4] = [config.width as f32, config.height as f32, 0.0, 0.0];
@@ -196,6 +198,7 @@ impl Renderer {
             surface,
             surface_config,
             rect_pipeline,
+            circle_pipeline,
             text_pipeline,
             viewport_buffer,
             viewport_bind_group,
@@ -237,6 +240,8 @@ impl Renderer {
             surface_texture,
             rect_vertices: Vec::new(),
             rect_indices: Vec::new(),
+            circle_vertices: Vec::new(),
+            circle_indices: Vec::new(),
             text_vertices: Vec::new(),
             text_indices: Vec::new(),
             glyph_draws: Vec::new(),
@@ -359,6 +364,16 @@ impl Renderer {
                         }
                     }
                 }
+                DisplayCommand::Circle(c) => {
+                    let r = c.radius;
+                    let base = frame.circle_vertices.len() as u16;
+                    let color = [c.color.r, c.color.g, c.color.b, c.color.a];
+                    let verts = circle_quad_vertices(c.cx, c.cy, r, color);
+                    frame.circle_vertices.extend_from_slice(&verts);
+                    for &i in &RECT_INDICES {
+                        frame.circle_indices.push(base + i);
+                    }
+                }
                 DisplayCommand::PushClip(c) => {
                     clip_stack.push(*c);
                 }
@@ -372,9 +387,10 @@ impl Renderer {
 
     pub fn end_frame(&self, frame: FrameRenderer) -> Result<(), GpuError> {
         let rect_empty = frame.rect_vertices.is_empty();
+        let circle_empty = frame.circle_vertices.is_empty();
         let text_empty = frame.text_vertices.is_empty();
 
-        if rect_empty && text_empty {
+        if rect_empty && circle_empty && text_empty {
             frame.surface_texture.present();
             return Ok(());
         }
@@ -433,6 +449,30 @@ impl Renderer {
                 pass.draw_indexed(0..frame.rect_indices.len() as u32, 0, 0..1);
             }
 
+            if !circle_empty {
+                let vertex_buffer =
+                    self.device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: None,
+                            contents: bytemuck::cast_slice(&frame.circle_vertices),
+                            usage: wgpu::BufferUsages::VERTEX,
+                        });
+
+                let index_buffer =
+                    self.device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: None,
+                            contents: bytemuck::cast_slice(&frame.circle_indices),
+                            usage: wgpu::BufferUsages::INDEX,
+                        });
+
+                pass.set_pipeline(&self.circle_pipeline.pipeline);
+                pass.set_bind_group(0, &self.viewport_bind_group, &[]);
+                pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+                pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+                pass.draw_indexed(0..frame.circle_indices.len() as u32, 0, 0..1);
+            }
+
             if !text_empty {
                 let vertex_buffer =
                     self.device
@@ -478,6 +518,8 @@ pub struct FrameRenderer {
     pub(crate) surface_texture: wgpu::SurfaceTexture,
     pub(crate) rect_vertices: Vec<Vertex>,
     pub(crate) rect_indices: Vec<u16>,
+    pub(crate) circle_vertices: Vec<CircleVertex>,
+    pub(crate) circle_indices: Vec<u16>,
     pub(crate) text_vertices: Vec<TextVertex>,
     pub(crate) text_indices: Vec<u32>,
     glyph_draws: Vec<GlyphDraw>,
