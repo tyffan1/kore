@@ -23,7 +23,7 @@ fn c(r: u8, g: u8, b: u8) -> Color {
 }
 
 fn text_draw(x: f32, y: f32, text: String, font_size: f32, color: Color) -> DrawText {
-    DrawText { x, y, text, font_size, color, font_family: Some(UI_FONT.to_string()), bold: false, italic: false }
+    DrawText { x, y, text, font_size, color, font_family: Some(UI_FONT.to_string()), bold: false, italic: false, opacity: 1.0, translate: (0.0, 0.0) }
 }
 
 struct AppState {
@@ -908,9 +908,9 @@ fn navigate(state: &mut AppState, mut url: url::Url) {
 
 fn draw_pill(list: &mut DisplayList, x: f32, y: f32, w: f32, h: f32, _radius: f32, color: Color) {
     let r = h * 0.3;
-    list.push_rect(DrawRect { x, y: y + r, width: w, height: h - 2.0 * r, color });
-    list.push_rect(DrawRect { x: x + r, y, width: w - 2.0 * r, height: r, color });
-    list.push_rect(DrawRect { x: x + r, y: y + h - r, width: w - 2.0 * r, height: r, color });
+    list.push_rect(DrawRect { x, y: y + r, width: w, height: h - 2.0 * r, color, opacity: 1.0, translate: (0.0, 0.0) });
+    list.push_rect(DrawRect { x: x + r, y, width: w - 2.0 * r, height: r, color, opacity: 1.0, translate: (0.0, 0.0) });
+    list.push_rect(DrawRect { x: x + r, y: y + h - r, width: w - 2.0 * r, height: r, color, opacity: 1.0, translate: (0.0, 0.0) });
 }
 
 /// Draw a left-pointing chevron using a proper typographic symbol.
@@ -935,11 +935,11 @@ fn draw_lock_icon(list: &mut DisplayList, x: f32, y: f32, size: f32, color: Colo
     let arc_w = size * 0.35;
     let arc_h = size * 0.35;
     // Shackle (arc)
-    list.push_rect(DrawRect { x: x + (size - arc_w) / 2.0, y, width: arc_w, height: arc_h * 0.6, color });
+    list.push_rect(DrawRect { x: x + (size - arc_w) / 2.0, y, width: arc_w, height: arc_h * 0.6, color, opacity: 1.0, translate: (0.0, 0.0) });
     // Body
-    list.push_rect(DrawRect { x: x + (size - bw) / 2.0, y: y + arc_h * 0.5, width: bw, height: bh, color });
+    list.push_rect(DrawRect { x: x + (size - bw) / 2.0, y: y + arc_h * 0.5, width: bw, height: bh, color, opacity: 1.0, translate: (0.0, 0.0) });
     // Keyhole
-    list.push_rect(DrawRect { x: x + size / 2.0 - 1.0, y: y + arc_h * 0.5 + bh * 0.3, width: 2.0, height: 3.0, color: c(ModernTheme::AddressBarBg.0, ModernTheme::AddressBarBg.1, ModernTheme::AddressBarBg.2) });
+    list.push_rect(DrawRect { x: x + size / 2.0 - 1.0, y: y + arc_h * 0.5 + bh * 0.3, width: 2.0, height: 3.0, color: c(ModernTheme::AddressBarBg.0, ModernTheme::AddressBarBg.1, ModernTheme::AddressBarBg.2), opacity: 1.0, translate: (0.0, 0.0) });
 }
 
 /// ── Drawing functions ──
@@ -960,7 +960,7 @@ fn draw_titlebar(list: &mut DisplayList, tabs: &[kore_browser::Tab], page_title:
     let rm = right_margin(style);
 
     // Tab bar background
-    list.push_rect(DrawRect { x: 0.0, y: 0.0, width: w, height: TAB_BAR_H, color: c(ModernTheme::TabBarBg.0, ModernTheme::TabBarBg.1, ModernTheme::TabBarBg.2) });
+    list.push_rect(DrawRect { x: 0.0, y: 0.0, width: w, height: TAB_BAR_H, color: c(ModernTheme::TabBarBg.0, ModernTheme::TabBarBg.1, ModernTheme::TabBarBg.2), opacity: 1.0, translate: (0.0, 0.0) });
 
     // ── Window controls ──
     match style {
@@ -977,30 +977,30 @@ fn draw_titlebar(list: &mut DisplayList, tabs: &[kore_browser::Tab], page_title:
             let hovered = (close_hov || min_hov || max_hov) && focused;
             if hovered {
                 let close_icon = Color::from_rgba8(100, 20, 20, 204);
-                list.push_rect(DrawRect { x: 15.0, y: 11.0, width: 1.5, height: 8.0, color: close_icon });
-                list.push_rect(DrawRect { x: 15.0, y: 11.0, width: 8.0, height: 1.5, color: close_icon });
+                list.push_rect(DrawRect { x: 15.0, y: 11.0, width: 1.5, height: 8.0, color: close_icon, opacity: 1.0, translate: (0.0, 0.0) });
+                list.push_rect(DrawRect { x: 15.0, y: 11.0, width: 8.0, height: 1.5, color: close_icon, opacity: 1.0, translate: (0.0, 0.0) });
 
                 let min_icon = Color::from_rgba8(80, 50, 0, 204);
-                list.push_rect(DrawRect { x: 38.0, y: 15.25, width: 8.0, height: 1.5, color: min_icon });
+                list.push_rect(DrawRect { x: 38.0, y: 15.25, width: 8.0, height: 1.5, color: min_icon, opacity: 1.0, translate: (0.0, 0.0) });
 
                 let max_icon = Color::from_rgba8(0, 60, 20, 204);
-                list.push_rect(DrawRect { x: 62.0, y: 11.0, width: 6.0, height: 1.5, color: max_icon });
-                list.push_rect(DrawRect { x: 62.0, y: 11.0, width: 1.5, height: 6.0, color: max_icon });
-                list.push_rect(DrawRect { x: 66.5, y: 15.5, width: 6.0, height: 1.5, color: max_icon });
-                list.push_rect(DrawRect { x: 66.5, y: 15.5, width: 1.5, height: 6.0, color: max_icon });
+                list.push_rect(DrawRect { x: 62.0, y: 11.0, width: 6.0, height: 1.5, color: max_icon, opacity: 1.0, translate: (0.0, 0.0) });
+                list.push_rect(DrawRect { x: 62.0, y: 11.0, width: 1.5, height: 6.0, color: max_icon, opacity: 1.0, translate: (0.0, 0.0) });
+                list.push_rect(DrawRect { x: 66.5, y: 15.5, width: 6.0, height: 1.5, color: max_icon, opacity: 1.0, translate: (0.0, 0.0) });
+                list.push_rect(DrawRect { x: 66.5, y: 15.5, width: 1.5, height: 6.0, color: max_icon, opacity: 1.0, translate: (0.0, 0.0) });
             }
         }
         WindowControlsStyle::Windows | WindowControlsStyle::Linux => {
             let min_bg = if min_hov { c(ModernTheme::WinBtnHover.0, ModernTheme::WinBtnHover.1, ModernTheme::WinBtnHover.2) } else { Color::TRANSPARENT };
-            list.push_rect(DrawRect { x: w - 138.0, y: 0.0, width: 46.0, height: TAB_BAR_H, color: min_bg });
+            list.push_rect(DrawRect { x: w - 138.0, y: 0.0, width: 46.0, height: TAB_BAR_H, color: min_bg, opacity: 1.0, translate: (0.0, 0.0) });
             list.push_text(text_draw(w - 121.0, 11.0, "\u{2212}".to_string(), 14.0, c(ModernTheme::TextPrimary.0, ModernTheme::TextPrimary.1, ModernTheme::TextPrimary.2)));
 
             let max_bg = if max_hov { c(ModernTheme::WinBtnHover.0, ModernTheme::WinBtnHover.1, ModernTheme::WinBtnHover.2) } else { Color::TRANSPARENT };
-            list.push_rect(DrawRect { x: w - 92.0, y: 0.0, width: 46.0, height: TAB_BAR_H, color: max_bg });
+            list.push_rect(DrawRect { x: w - 92.0, y: 0.0, width: 46.0, height: TAB_BAR_H, color: max_bg, opacity: 1.0, translate: (0.0, 0.0) });
             list.push_text(text_draw(w - 75.0, 11.0, "\u{25A1}".to_string(), 14.0, c(ModernTheme::TextPrimary.0, ModernTheme::TextPrimary.1, ModernTheme::TextPrimary.2)));
 
             let close_bg = if close_hov { c(ModernTheme::CloseRed.0, ModernTheme::CloseRed.1, ModernTheme::CloseRed.2) } else { Color::TRANSPARENT };
-            list.push_rect(DrawRect { x: w - 46.0, y: 0.0, width: 46.0, height: TAB_BAR_H, color: close_bg });
+            list.push_rect(DrawRect { x: w - 46.0, y: 0.0, width: 46.0, height: TAB_BAR_H, color: close_bg, opacity: 1.0, translate: (0.0, 0.0) });
             list.push_text(text_draw(w - 29.0, 11.0, "\u{00D7}".to_string(), 14.0, c(ModernTheme::TextPrimary.0, ModernTheme::TextPrimary.1, ModernTheme::TextPrimary.2)));
         }
     }
@@ -1058,11 +1058,11 @@ fn draw_titlebar(list: &mut DisplayList, tabs: &[kore_browser::Tab], page_title:
 
 fn draw_navbar(list: &mut DisplayList, w: f32, back_hov: bool, fwd_hov: bool, rld_hov: bool, loading: bool, url_text: String, is_secure: bool, cursor_pos: usize, selection_start: Option<usize>, cursor_visible: bool, address_bar_focused: bool) {
     // Toolbar background
-    list.push_rect(DrawRect { x: 0.0, y: TAB_BAR_H, width: w, height: TOOLBAR_H, color: c(ModernTheme::ToolbarBg.0, ModernTheme::ToolbarBg.1, ModernTheme::ToolbarBg.2) });
+    list.push_rect(DrawRect { x: 0.0, y: TAB_BAR_H, width: w, height: TOOLBAR_H, color: c(ModernTheme::ToolbarBg.0, ModernTheme::ToolbarBg.1, ModernTheme::ToolbarBg.2), opacity: 1.0, translate: (0.0, 0.0) });
 
     // No top border — color depth separates tab bar from toolbar
     // Subtle bottom border
-    list.push_rect(DrawRect { x: 0.0, y: TAB_BAR_H + TOOLBAR_H - 1.0, width: w, height: 1.0, color: c(ModernTheme::BorderSubtle.0, ModernTheme::BorderSubtle.1, ModernTheme::BorderSubtle.2) });
+    list.push_rect(DrawRect { x: 0.0, y: TAB_BAR_H + TOOLBAR_H - 1.0, width: w, height: 1.0, color: c(ModernTheme::BorderSubtle.0, ModernTheme::BorderSubtle.1, ModernTheme::BorderSubtle.2), opacity: 1.0, translate: (0.0, 0.0) });
 
     // ── Back button ──
     let back_bg = if back_hov { c(ModernTheme::TabHoverBg.0, ModernTheme::TabHoverBg.1, ModernTheme::TabHoverBg.2) } else { Color::TRANSPARENT };
@@ -1143,6 +1143,8 @@ fn draw_navbar(list: &mut DisplayList, w: f32, back_hov: bool, fwd_hov: bool, rl
                 width: sel_width.max(1.0),
                 height: 14.0 + 4.0,
                 color: Color::from_rgba8(ModernTheme::Accent.0, ModernTheme::Accent.1, ModernTheme::Accent.2, 100),
+                opacity: 1.0,
+                translate: (0.0, 0.0),
             });
         }
 
@@ -1153,6 +1155,8 @@ fn draw_navbar(list: &mut DisplayList, w: f32, back_hov: bool, fwd_hov: bool, rl
                 width: 2.0,
                 height: 14.0 + 4.0,
                 color: c(ModernTheme::TextPrimary.0, ModernTheme::TextPrimary.1, ModernTheme::TextPrimary.2),
+                opacity: 1.0,
+                translate: (0.0, 0.0),
             });
         }
     }
@@ -1160,7 +1164,7 @@ fn draw_navbar(list: &mut DisplayList, w: f32, back_hov: bool, fwd_hov: bool, rl
 
     // Loading progress bar
     if loading {
-        list.push_rect(DrawRect { x: addr_x, y: addr_y + addr_h - 2.0, width: addr_w, height: 2.0, color: Color::from_rgba8(ModernTheme::Accent.0, ModernTheme::Accent.1, ModernTheme::Accent.2, 180) });
+        list.push_rect(DrawRect { x: addr_x, y: addr_y + addr_h - 2.0, width: addr_w, height: 2.0, color: Color::from_rgba8(ModernTheme::Accent.0, ModernTheme::Accent.1, ModernTheme::Accent.2, 180), opacity: 1.0, translate: (0.0, 0.0) });
     }
 }
 
@@ -1200,7 +1204,7 @@ fn build_display_list(state: &mut AppState) {
     list.clear();
 
     // Page background behind content
-    list.push_rect(DrawRect { x: 0.0, y: 0.0, width, height, color: c(ModernTheme::TabBarBg.0, ModernTheme::TabBarBg.1, ModernTheme::TabBarBg.2) });
+    list.push_rect(DrawRect { x: 0.0, y: 0.0, width, height, color: c(ModernTheme::TabBarBg.0, ModernTheme::TabBarBg.1, ModernTheme::TabBarBg.2), opacity: 1.0, translate: (0.0, 0.0) });
 
     // Row 1 - Titlebar + Tabs (y=0..36)
     draw_titlebar(list, &tabs, page_title, width, min_hov, max_hov, close_hov, focused, hovered_tab);
@@ -1215,6 +1219,8 @@ fn build_display_list(state: &mut AppState) {
     list.push_rect(DrawRect {
         x: 16.0, y: content_area_y, width: width - 32.0, height: content_area_h,
         color: Color::from_rgba8(255, 255, 255, 255),
+        opacity: 1.0,
+        translate: (0.0, 0.0),
     });
 
     let content_height = state.content_display_list.commands().iter().fold(0.0f32, |max_y, cmd| {
@@ -1233,7 +1239,7 @@ fn build_display_list(state: &mut AppState) {
             DisplayCommand::Rect(rect) => {
                 let render_y = content_area_y + rect.y - sy;
                 if render_y + rect.height < content_area_y || render_y > height { continue; }
-                list.push_rect(DrawRect { x: 16.0 + rect.x, y: render_y, width: rect.width, height: rect.height, color: rect.color });
+                list.push_rect(DrawRect { x: 16.0 + rect.x, y: render_y, width: rect.width, height: rect.height, color: rect.color, opacity: 1.0, translate: (0.0, 0.0) });
             }
             DisplayCommand::Text(text) => {
                 let render_x = 16.0 + text.x;
@@ -1249,7 +1255,7 @@ fn build_display_list(state: &mut AppState) {
     list.pop_clip();
 
     // Mask header (y=0..80) to cover any content overflow, then redraw UI
-    list.push_rect(DrawRect { x: 0.0, y: 0.0, width, height: HEADER_H, color: c(ModernTheme::TabBarBg.0, ModernTheme::TabBarBg.1, ModernTheme::TabBarBg.2) });
+    list.push_rect(DrawRect { x: 0.0, y: 0.0, width, height: HEADER_H, color: c(ModernTheme::TabBarBg.0, ModernTheme::TabBarBg.1, ModernTheme::TabBarBg.2), opacity: 1.0, translate: (0.0, 0.0) });
     draw_titlebar(list, &tabs, page_title, width, min_hov, max_hov, close_hov, focused, hovered_tab);
     draw_navbar(list, width, back_hov, fwd_hov, rld_hov, loading, url_text, is_secure, cursor_pos, selection_start, cursor_visible, address_bar_focused);
 
@@ -1262,8 +1268,8 @@ fn build_display_list(state: &mut AppState) {
         let visible_ratio = (content_area_h / content_height).min(1.0);
         let thumb_height = (visible_ratio * content_area_h).max(20.0);
         let thumb_y = content_area_y + scroll_frac * (content_area_h - thumb_height);
-        list.push_rect(DrawRect { x: sb_x, y: content_area_y, width: scrollbar_width, height: content_area_h, color: Color::from_rgba8(ModernTheme::BorderSubtle.0, ModernTheme::BorderSubtle.1, ModernTheme::BorderSubtle.2, 100) });
-        list.push_rect(DrawRect { x: sb_x, y: thumb_y, width: scrollbar_width, height: thumb_height, color: Color::from_rgba8(ModernTheme::TextSecondary.0, ModernTheme::TextSecondary.1, ModernTheme::TextSecondary.2, 150) });
+        list.push_rect(DrawRect { x: sb_x, y: content_area_y, width: scrollbar_width, height: content_area_h, color: Color::from_rgba8(ModernTheme::BorderSubtle.0, ModernTheme::BorderSubtle.1, ModernTheme::BorderSubtle.2, 100), opacity: 1.0, translate: (0.0, 0.0) });
+        list.push_rect(DrawRect { x: sb_x, y: thumb_y, width: scrollbar_width, height: thumb_height, color: Color::from_rgba8(ModernTheme::TextSecondary.0, ModernTheme::TextSecondary.1, ModernTheme::TextSecondary.2, 150), opacity: 1.0, translate: (0.0, 0.0) });
     }
 
 }

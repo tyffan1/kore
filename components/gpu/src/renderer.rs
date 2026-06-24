@@ -338,50 +338,56 @@ impl Renderer {
         for cmd in list.commands() {
             match cmd {
                 DisplayCommand::Rect(r) => {
+                    let render_x = r.x + r.translate.0;
+                    let render_y = r.y + r.translate.1;
                     if let Some(clip) = clip_stack.last() {
                         let rect_clip = crate::display_list::ClipRect {
-                            x: r.x,
-                            y: r.y,
+                            x: render_x,
+                            y: render_y,
                             width: r.width,
                             height: r.height,
                         };
                         if !clip.intersects(&rect_clip) {
                             continue;
                         }
-                        if r.y + r.height < clip.y || r.y > clip.y + clip.height {
+                        if render_y + r.height < clip.y || render_y > clip.y + clip.height {
                             continue;
                         }
                     }
                     let base = frame.rect_vertices.len() as u16;
-                    let color = [r.color.r, r.color.g, r.color.b, r.color.a];
-                    let verts = rect_vertices(r.x, r.y, r.width, r.height, color);
+                    let effective_alpha = r.color.a * r.opacity;
+                    let color = [r.color.r, r.color.g, r.color.b, effective_alpha];
+                    let verts = rect_vertices(render_x, render_y, r.width, r.height, color);
                     frame.rect_vertices.extend_from_slice(&verts);
                     for &i in &RECT_INDICES {
                         frame.rect_indices.push(base + i);
                     }
                 }
                 DisplayCommand::Text(t) => {
+                    let render_x = t.x + t.translate.0;
+                    let render_y = t.y + t.translate.1;
                     if let Some(clip) = clip_stack.last() {
                         let approx_w = t.font_size * t.text.len() as f32 * 0.6;
                         let approx_h = t.font_size * 1.2;
                         let rect_clip = crate::display_list::ClipRect {
-                            x: t.x,
-                            y: t.y,
+                            x: render_x,
+                            y: render_y,
                             width: approx_w,
                             height: approx_h,
                         };
                         if !clip.intersects(&rect_clip) {
                             continue;
                         }
-                        if t.y + t.font_size < clip.y || t.y > clip.y + clip.height {
+                        if render_y + t.font_size < clip.y || render_y > clip.y + clip.height {
                             continue;
                         }
-                        if t.y < clip.y {
+                        if render_y < clip.y {
                             continue;
                         }
                     }
-                    let color = [t.color.r, t.color.g, t.color.b, t.color.a];
-                    let mut cursor_x = t.x;
+                    let effective_alpha = t.color.a * t.opacity;
+                    let color = [t.color.r, t.color.g, t.color.b, effective_alpha];
+                    let mut cursor_x = render_x;
                     let mut font_cache = self.font_cache.borrow_mut();
                     let font_id = self.resolve_font(t.font_family.as_deref());
                     for ch in t.text.chars() {
@@ -424,7 +430,7 @@ impl Renderer {
                                     }
                                 };
                                 let dest_x = cursor_x + glyph.x_offset as f32;
-                                let dest_y = t.y - glyph.y_offset as f32 - glyph.height as f32;
+                                let dest_y = render_y - glyph.y_offset as f32 - glyph.height as f32;
                                 let verts = text_quad_vertices(dest_x, dest_y, glyph.width as f32, glyph.height as f32, 0.0, 0.0, 1.0, 1.0, color);
                                 let vertex_base = frame.text_vertices.len() as u16;
                                 frame.text_vertices.extend_from_slice(&verts);

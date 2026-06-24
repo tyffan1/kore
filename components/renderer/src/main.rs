@@ -106,39 +106,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn create_demo_list() -> DisplayList {
     let mut list = DisplayList::new();
     list.push_rect(DrawRect {
-        x: 0.0,
-        y: 0.0,
-        width: 1280.0,
-        height: 720.0,
+        x: 0.0, y: 0.0, width: 1280.0, height: 720.0,
         color: Color::from_rgba8(240, 240, 245, 255),
+        opacity: 1.0, translate: (0.0, 0.0),
     });
     list.push_rect(DrawRect {
-        x: 0.0,
-        y: 0.0,
-        width: 1280.0,
-        height: 48.0,
+        x: 0.0, y: 0.0, width: 1280.0, height: 48.0,
         color: Color::from_rgba8(30, 30, 35, 255),
+        opacity: 1.0, translate: (0.0, 0.0),
     });
     list.push_rect(DrawRect {
-        x: 50.0,
-        y: 80.0,
-        width: 200.0,
-        height: 150.0,
+        x: 50.0, y: 80.0, width: 200.0, height: 150.0,
         color: Color::from_rgba8(66, 133, 244, 255),
+        opacity: 1.0, translate: (0.0, 0.0),
     });
     list.push_rect(DrawRect {
-        x: 280.0,
-        y: 80.0,
-        width: 200.0,
-        height: 150.0,
+        x: 280.0, y: 80.0, width: 200.0, height: 150.0,
         color: Color::from_rgba8(52, 168, 83, 255),
+        opacity: 1.0, translate: (0.0, 0.0),
     });
     list.push_rect(DrawRect {
-        x: 510.0,
-        y: 80.0,
-        width: 200.0,
-        height: 150.0,
+        x: 510.0, y: 80.0, width: 200.0, height: 150.0,
         color: Color::from_rgba8(251, 188, 4, 255),
+        opacity: 1.0, translate: (0.0, 0.0),
     });
     list
 }
@@ -184,6 +174,8 @@ fn frame_cmd_to_display_cmd(cmd: &FrameRenderCommand) -> Option<DisplayCommand> 
                 width: *width as f32,
                 height: *height as f32,
                 color: c,
+                opacity: 1.0,
+                translate: (0.0, 0.0),
             }))
         }
         FrameRenderCommand::Text {

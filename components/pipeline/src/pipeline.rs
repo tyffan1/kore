@@ -391,7 +391,7 @@ fn traverse_node(
             if let Some(ln) = layout_tree.nodes.iter().find(|n| n.dom_node_id == Some(dom_id)) {
                 if ln.rect.width > 0.0 && ln.rect.height > 0.0 {
                     if let Some(color) = ln.style.background_color.map(to_gpu_color).or_else(|| default_bg_color(&el.tag_name)) {
-                        dl.push_rect(DrawRect { x: ln.rect.x, y: ln.rect.y, width: ln.rect.width, height: ln.rect.height, color });
+                        dl.push_rect(DrawRect { x: ln.rect.x, y: ln.rect.y, width: ln.rect.width, height: ln.rect.height, color, opacity: 1.0, translate: (0.0, 0.0) });
                     }
                 }
             }
@@ -415,6 +415,8 @@ fn traverse_node(
                     font_family: Some("sans-serif".to_string()),
                     bold: false,
                     italic: false,
+                    opacity: 1.0,
+                    translate: (0.0, 0.0),
                 });
             }
         }
@@ -496,6 +498,8 @@ pub fn build_display_list(document: &kore_html::Document, layout_tree: &LayoutTr
                 width: node.rect.width,
                 height: node.rect.height,
                 color,
+                opacity: 1.0,
+                translate: (0.0, 0.0),
             });
         }
 
@@ -541,6 +545,8 @@ pub fn build_display_list(document: &kore_html::Document, layout_tree: &LayoutTr
                                 font_family: Some("sans-serif".to_string()),
                                 bold,
                                 italic,
+                                opacity: 1.0,
+                                translate: (0.0, 0.0),
                             });
 
                             if is_inline {
@@ -557,6 +563,8 @@ pub fn build_display_list(document: &kore_html::Document, layout_tree: &LayoutTr
                             width: node.rect.width,
                             height: node.rect.height,
                             color: Color::from_rgba8(200, 200, 200, 255),
+                            opacity: 1.0,
+                            translate: (0.0, 0.0),
                         });
                     }
                     _ => {}

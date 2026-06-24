@@ -87,3 +87,71 @@ pub struct ParseDiagnostic {
     pub message: String,
     pub position: usize,
 }
+
+// ── Animation & Transition types ──
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Transition {
+    pub property: String,
+    pub duration_ms: f32,
+    pub timing: TimingFunction,
+    pub delay_ms: f32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TimingFunction {
+    Linear,
+    Ease,
+    EaseIn,
+    EaseOut,
+    EaseInOut,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct KeyframeAnimation {
+    pub name: String,
+    pub duration_ms: f32,
+    pub timing: TimingFunction,
+    pub iteration_count: AnimationIterationCount,
+    pub direction: AnimationDirection,
+    pub fill_mode: AnimationFillMode,
+    pub delay_ms: f32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AnimationIterationCount {
+    Count(f32),
+    Infinite,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AnimationDirection {
+    Normal,
+    Reverse,
+    Alternate,
+    AlternateReverse,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AnimationFillMode {
+    None,
+    Forwards,
+    Backwards,
+    Both,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TransformValue {
+    Translate(f32, f32),
+    TranslateX(f32),
+    TranslateY(f32),
+    Scale(f32, f32),
+    ScaleX(f32),
+    ScaleY(f32),
+    Rotate(f32),
+    SkewX(f32),
+    SkewY(f32),
+    Matrix(f32, f32, f32, f32, f32, f32),
+}
+
+pub type Transform = Vec<TransformValue>;

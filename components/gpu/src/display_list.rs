@@ -34,6 +34,8 @@ pub struct DrawRect {
     pub width: f32,
     pub height: f32,
     pub color: Color,
+    pub opacity: f32,
+    pub translate: (f32, f32),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -46,6 +48,8 @@ pub struct DrawText {
     pub font_family: Option<String>,
     pub bold: bool,
     pub italic: bool,
+    pub opacity: f32,
+    pub translate: (f32, f32),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

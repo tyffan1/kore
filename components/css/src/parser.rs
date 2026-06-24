@@ -408,6 +408,96 @@ pub fn parse_stylesheet(input: &str) -> Result<StyleSheet, ParserError> {
     CssParser::new(input).parse()
 }
 
+/// Parse a CSS transition value like "opacity 0.3s ease, transform 0.5s linear".
+pub fn parse_transition(value: &str) -> Vec<crate::Transition> {
+    let mut transitions = Vec::new();
+    for part in value.split(',') {
+        let tokens: Vec<&str> = part.trim().split_whitespace().collect();
+        if tokens.is_empty() {
+            continue;
+        }
+        let property = tokens[0].to_string();
+        let duration_ms = tokens.get(1).and_then(|s| parse_time_ms(s)).unwrap_or(0.0);
+        let timing = tokens.get(2).map(|s| parse_timing_function(s)).unwrap_or(crate::TimingFunction::Ease);
+        let delay_ms = tokens.get(3).and_then(|s| parse_time_ms(s)).unwrap_or(0.0);
+        transitions.push(crate::Transition { property, duration_ms, timing, delay_ms });
+    }
+    transitions
+}
+
+/// Parse a CSS time value (e.g. "300ms", "0.5s") and return milliseconds.
+pub fn parse_time_ms(s: &str) -> Option<f32> {
+    if let Some(ms) = s.strip_suffix("ms") {
+        ms.parse().ok()
+    } else if let Some(s_val) = s.strip_suffix('s') {
+        s_val.parse::<f32>().ok().map(|v| v * 1000.0)
+    } else {
+        None
+    }
+}
+
+/// Parse a CSS timing function name.
+pub fn parse_timing_function(s: &str) -> crate::TimingFunction {
+    match s {
+        "linear" => crate::TimingFunction::Linear,
+        "ease" => crate::TimingFunction::Ease,
+        "ease-in" => crate::TimingFunction::EaseIn,
+        "ease-out" => crate::TimingFunction::EaseOut,
+        "ease-in-out" => crate::TimingFunction::EaseInOut,
+        _ => crate::TimingFunction::Ease,
+    }
+}
+
+/// Parse a CSS transform value (e.g. "translateX(100px) scale(2)").
+pub fn parse_transform(value: &str) -> crate::Transform {
+    let mut transforms = Vec::new();
+    let mut remaining = value.trim();
+    while !remaining.is_empty() {
+        if let Some(end) = remaining.find(')') {
+            let func_str = &remaining[..=end];
+            remaining = remaining[end + 1..].trim();
+            if let Some(tv) = parse_single_transform(func_str) {
+                transforms.push(tv);
+            }
+        } else {
+            break;
+        }
+    }
+    transforms
+}
+
+fn parse_single_transform(s: &str) -> Option<crate::TransformValue> {
+    let s = s.trim();
+    if let Some(args_str) = s.strip_prefix("translate(").and_then(|s| s.strip_suffix(')')) {
+        let args: Vec<f32> = args_str.split(',').filter_map(|a| a.trim().trim_end_matches("px").parse().ok()).collect();
+        return Some(crate::TransformValue::Translate(args.first().copied().unwrap_or(0.0), args.get(1).copied().unwrap_or(0.0)));
+    }
+    if let Some(arg) = s.strip_prefix("translateX(").and_then(|s| s.strip_suffix(')')) {
+        return Some(crate::TransformValue::TranslateX(arg.trim().trim_end_matches("px").parse().unwrap_or(0.0)));
+    }
+    if let Some(arg) = s.strip_prefix("translateY(").and_then(|s| s.strip_suffix(')')) {
+        return Some(crate::TransformValue::TranslateY(arg.trim().trim_end_matches("px").parse().unwrap_or(0.0)));
+    }
+    if let Some(args_str) = s.strip_prefix("scale(").and_then(|s| s.strip_suffix(')')) {
+        let args: Vec<f32> = args_str.split(',').filter_map(|a| a.trim().parse().ok()).collect();
+        let x = args.first().copied().unwrap_or(1.0);
+        let y = args.get(1).copied().unwrap_or(x);
+        return Some(crate::TransformValue::Scale(x, y));
+    }
+    if let Some(arg) = s.strip_prefix("scaleX(").and_then(|s| s.strip_suffix(')')) {
+        return Some(crate::TransformValue::ScaleX(arg.trim().parse().unwrap_or(1.0)));
+    }
+    if let Some(arg) = s.strip_prefix("scaleY(").and_then(|s| s.strip_suffix(')')) {
+        return Some(crate::TransformValue::ScaleY(arg.trim().parse().unwrap_or(1.0)));
+    }
+    if let Some(arg) = s.strip_prefix("rotate(").and_then(|s| s.strip_suffix(')')) {
+        let deg: f32 = arg.trim().trim_end_matches("deg").trim_end_matches("rad").parse().unwrap_or(0.0);
+        let deg = if arg.contains("rad") { deg * 180.0 / std::f32::consts::PI } else { deg };
+        return Some(crate::TransformValue::Rotate(deg));
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -473,5 +563,53 @@ mod tests {
         assert_eq!(rule.declarations[0].value, "red");
         assert!(!rule.declarations[1].important);
         Ok(())
+    }
+
+    #[test]
+    fn parses_transition_opacity() {
+        let t = parse_transition("opacity 0.3s ease");
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].property, "opacity");
+        assert!((t[0].duration_ms - 300.0).abs() < 0.01);
+        assert!(matches!(t[0].timing, crate::TimingFunction::Ease));
+    }
+
+    #[test]
+    fn parses_transition_multiple() {
+        let t = parse_transition("opacity 0.3s ease, transform 0.5s linear");
+        assert_eq!(t.len(), 2);
+        assert_eq!(t[1].property, "transform");
+        assert!((t[1].duration_ms - 500.0).abs() < 0.01);
+        assert!(matches!(t[1].timing, crate::TimingFunction::Linear));
+    }
+
+    #[test]
+    fn parses_transform_translate() {
+        let t = parse_transform("translate(10px, 20px)");
+        assert_eq!(t.len(), 1);
+        assert!(matches!(t[0], crate::TransformValue::Translate(10.0, 20.0)));
+    }
+
+    #[test]
+    fn parses_transform_rotate() {
+        let t = parse_transform("rotate(45deg)");
+        assert_eq!(t.len(), 1);
+        assert!(matches!(t[0], crate::TransformValue::Rotate(deg) if (deg - 45.0).abs() < 0.01));
+    }
+
+    #[test]
+    fn parses_transform_multiple() {
+        let t = parse_transform("translateX(100px) scale(2)");
+        assert_eq!(t.len(), 2);
+        assert!(matches!(t[0], crate::TransformValue::TranslateX(100.0)));
+        assert!(matches!(t[1], crate::TransformValue::Scale(2.0, 2.0)));
+    }
+
+    #[test]
+    fn parses_time_ms() {
+        assert!((super::parse_time_ms("300ms").unwrap() - 300.0).abs() < 0.01);
+        assert!((super::parse_time_ms("0.5s").unwrap() - 500.0).abs() < 0.01);
+        assert!(super::parse_time_ms("1s").unwrap() - 1000.0 < 0.01);
+        assert!(super::parse_time_ms("invalid").is_none());
     }
 }

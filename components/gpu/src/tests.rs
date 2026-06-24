@@ -20,6 +20,8 @@ mod display_list_tests {
             width: 100.0,
             height: 50.0,
             color: Color::BLACK,
+            opacity: 1.0,
+            translate: (0.0, 0.0),
         });
         assert_eq!(list.len(), 1);
         assert!(!list.is_empty());
@@ -34,6 +36,8 @@ mod display_list_tests {
             width: 10.0,
             height: 10.0,
             color: Color::BLACK,
+            opacity: 1.0,
+            translate: (0.0, 0.0),
         });
         list.push_text(DrawText {
             x: 5.0,
@@ -44,6 +48,8 @@ mod display_list_tests {
             font_family: None,
             bold: false,
             italic: false,
+            opacity: 1.0,
+            translate: (0.0, 0.0),
         });
         list.push_image(DrawImage {
             x: 20.0,
@@ -71,6 +77,8 @@ mod display_list_tests {
             width: 50.0,
             height: 50.0,
             color: Color::WHITE,
+            opacity: 1.0,
+            translate: (0.0, 0.0),
         });
         list.pop_clip();
 
@@ -90,6 +98,8 @@ mod display_list_tests {
             width: 10.0,
             height: 10.0,
             color: Color::BLACK,
+            opacity: 1.0,
+            translate: (0.0, 0.0),
         });
         list.clear();
         assert!(list.is_empty());
