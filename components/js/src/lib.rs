@@ -91,6 +91,83 @@ impl JsRuntime {
         Ok(())
     }
 
+    pub fn dispatch_event(&self, node_id: Option<NodeId>, event_type: &str) -> Result<(), JsError> {
+        let listeners = {
+            let state = self.dom_state.lock().unwrap();
+            let mut matching = Vec::new();
+
+            if let Some(nid) = node_id {
+                if let Some(listeners) = state.event_listeners.get(&nid) {
+                    for (etype, callback) in listeners {
+                        if etype == event_type {
+                            matching.push(callback.clone());
+                        }
+                    }
+                }
+            }
+
+            let doc_id = NodeId(0);
+            if let Some(listeners) = state.event_listeners.get(&doc_id) {
+                for (etype, callback) in listeners {
+                    if etype == event_type {
+                        matching.push(callback.clone());
+                    }
+                }
+            }
+
+            matching
+        };
+
+        let mut ctx = self.context.borrow_mut();
+
+        let event_obj = JsObject::with_null_proto();
+        event_obj.set(JsString::from("type"), JsString::from(event_type), false, &mut ctx)
+            .map_err(|e| JsError::Context(e.to_string()))?;
+        event_obj.set(JsString::from("bubbles"), false, false, &mut ctx)
+            .map_err(|e| JsError::Context(e.to_string()))?;
+        event_obj.set(JsString::from("cancelable"), false, false, &mut ctx)
+            .map_err(|e| JsError::Context(e.to_string()))?;
+        event_obj.set(JsString::from("preventDefault"),
+            FunctionObjectBuilder::new(ctx.realm(), NativeFunction::from_fn_ptr(|_,_,_| Ok(BoaValue::Undefined))).build(),
+            false, &mut ctx).ok();
+        event_obj.set(JsString::from("stopPropagation"),
+            FunctionObjectBuilder::new(ctx.realm(), NativeFunction::from_fn_ptr(|_,_,_| Ok(BoaValue::Undefined))).build(),
+            false, &mut ctx).ok();
+
+        for callback in listeners {
+            if let Some(cb_obj) = callback.as_callable() {
+                let _ = cb_obj.call(
+                    &BoaValue::Undefined,
+                    &[BoaValue::Object(event_obj.clone())],
+                    &mut ctx,
+                );
+            }
+        }
+
+        ctx.run_jobs();
+        Ok(())
+    }
+
+    pub fn dispatch_dom_content_loaded(&self) -> Result<(), JsError> {
+        {
+            let mut ctx = self.context.borrow_mut();
+            ctx.eval(Source::from_bytes(
+                r#"if (typeof document !== 'undefined') { document.readyState = 'interactive'; }"#,
+            )).ok();
+            ctx.run_jobs();
+        }
+        self.dispatch_event(None, "DOMContentLoaded")?;
+        {
+            let mut ctx = self.context.borrow_mut();
+            ctx.eval(Source::from_bytes(
+                r#"if (typeof document !== 'undefined') { document.readyState = 'complete'; }"#,
+            )).ok();
+            ctx.run_jobs();
+        }
+        self.dispatch_event(None, "load")?;
+        Ok(())
+    }
+
     pub fn document(&self) -> Arc<Mutex<Document>> {
         self.document.clone()
     }
@@ -139,7 +216,7 @@ var console = {
         ctx.register_global_property(JsString::from("document"), document_obj.clone(), Attribute::all())
             .map_err(|e| JsError::Context(e.to_string()))?;
 
-        let window_obj = build_window_object(&mut ctx, &self.pending_navigation)?;
+        let window_obj = build_window_object(&mut ctx, &self.pending_navigation, &self.dom_state)?;
         ctx.register_global_property(JsString::from("window"), window_obj.clone(), Attribute::all())
             .map_err(|e| JsError::Context(e.to_string()))?;
 
@@ -298,6 +375,90 @@ window.fetch = function(url, options) {
     });
 };
 var fetch = window.fetch;"#,
+        ))
+        .map_err(|e| JsError::Context(e.to_string()))?;
+
+        ctx.eval(Source::from_bytes(
+            r#"
+document.readyState = 'loading';
+
+document.dispatchEvent = function(event) {
+    return true;
+};
+window.dispatchEvent = function(event) {
+    return true;
+};
+"#,
+        ))
+        .map_err(|e| JsError::Context(e.to_string()))?;
+
+        ctx.eval(Source::from_bytes(
+            r#"
+var __localStorage = {};
+var localStorage = {
+    getItem: function(key) {
+        return __localStorage.hasOwnProperty(key) ? __localStorage[key] : null;
+    },
+    setItem: function(key, value) {
+        __localStorage[key] = String(value);
+    },
+    removeItem: function(key) {
+        delete __localStorage[key];
+    },
+    clear: function() {
+        __localStorage = {};
+    },
+    get length() {
+        return Object.keys(__localStorage).length;
+    },
+    key: function(index) {
+        return Object.keys(__localStorage)[index] || null;
+    }
+};
+window.localStorage = localStorage;
+
+var __sessionStorage = {};
+var sessionStorage = {
+    getItem: function(key) {
+        return __sessionStorage.hasOwnProperty(key) ? __sessionStorage[key] : null;
+    },
+    setItem: function(key, value) {
+        __sessionStorage[key] = String(value);
+    },
+    removeItem: function(key) {
+        delete __sessionStorage[key];
+    },
+    clear: function() {
+        __sessionStorage = {};
+    },
+    get length() {
+        return Object.keys(__sessionStorage).length;
+    },
+    key: function(index) {
+        return Object.keys(__sessionStorage)[index] || null;
+    }
+};
+window.sessionStorage = sessionStorage;
+"#,
+        ))
+        .map_err(|e| JsError::Context(e.to_string()))?;
+
+        ctx.eval(Source::from_bytes(
+            r#"
+window.history = {
+    length: 1,
+    pushState: function(state, title, url) {
+        if (url) __window_location_set_href(url);
+    },
+    replaceState: function(state, title, url) {
+        if (url) __window_location_set_href(url);
+    },
+    back: function() {},
+    forward: function() {},
+    go: function() {}
+};
+var history = window.history;
+"#,
         ))
         .map_err(|e| JsError::Context(e.to_string()))?;
 
@@ -661,6 +822,31 @@ fn build_document_object(
 
     let location_obj = build_location_object(ctx, nav_sink);
     document_obj.set(JsString::from("location"), location_obj, false, ctx)
+        .map_err(|e| JsError::Context(e.to_string()))?;
+
+    let doc_add_listener = {
+        let ds = dom_state.clone();
+        unsafe {
+            NativeFunction::from_closure(move |_, args, _ctx| {
+                let event_type = args.first()
+                    .and_then(|v| v.as_string())
+                    .map(|s| s.to_std_string_escaped())
+                    .unwrap_or_default();
+                let callback = args.get(1).cloned().unwrap_or(BoaValue::Undefined);
+                if !event_type.is_empty() && !callback.is_undefined() {
+                    let mut state = ds.lock().unwrap();
+                    state.event_listeners
+                        .entry(NodeId(0))
+                        .or_default()
+                        .push((event_type, callback));
+                }
+                Ok(BoaValue::Undefined)
+            })
+        }
+    };
+    let fn_obj = FunctionObjectBuilder::new(ctx.realm(), doc_add_listener)
+        .name("addEventListener").length(2).build();
+    document_obj.set(JsString::from("addEventListener"), fn_obj, false, ctx)
         .map_err(|e| JsError::Context(e.to_string()))?;
 
     Ok(document_obj)
@@ -1342,14 +1528,34 @@ fn create_element_object(
 
 // ============ Window Object ============
 
-fn build_window_object(ctx: &mut Context, nav_sink: &Arc<Mutex<Option<String>>>) -> Result<JsObject, JsError> {
+fn build_window_object(ctx: &mut Context, nav_sink: &Arc<Mutex<Option<String>>>, dom_state: &Arc<Mutex<DomState>>) -> Result<JsObject, JsError> {
     let win = JsObject::with_null_proto();
 
     let location_obj = build_location_object(ctx, nav_sink);
     win.set(JsString::from("location"), location_obj, false, ctx)
         .map_err(|e| JsError::Context(e.to_string()))?;
 
-    let win_add_el_fn = FunctionObjectBuilder::new(ctx.realm(), NativeFunction::from_fn_ptr(|_, _, _| Ok(BoaValue::Undefined)))
+    let win_add_el_fn = {
+        let dom_state = dom_state.clone();
+        unsafe {
+            NativeFunction::from_closure(move |_, args, _ctx| {
+                let event_type = args.first()
+                    .and_then(|v| v.as_string())
+                    .map(|s| s.to_std_string_escaped())
+                    .unwrap_or_default();
+                let callback = args.get(1).cloned().unwrap_or(BoaValue::Undefined);
+                if !event_type.is_empty() && !callback.is_undefined() {
+                    let mut state = dom_state.lock().unwrap();
+                    state.event_listeners
+                        .entry(NodeId(0))
+                        .or_default()
+                        .push((event_type, callback));
+                }
+                Ok(BoaValue::Undefined)
+            })
+        }
+    };
+    let win_add_el_fn = FunctionObjectBuilder::new(ctx.realm(), win_add_el_fn)
         .name("addEventListener").build();
     win.set(JsString::from("addEventListener"), win_add_el_fn, false, ctx)
         .map_err(|e| JsError::Context(e.to_string()))?;
@@ -1970,6 +2176,66 @@ xhr.readyState;
             xhr.send();
             loaded
         "#)?;
+        Ok(())
+    }
+
+    #[test]
+    fn dom_content_loaded_fires_listeners() -> Result<(), JsError> {
+        let rt = JsRuntime::new(make_doc())?;
+        rt.eval(r#"
+            var fired = false;
+            document.addEventListener('DOMContentLoaded', function() {
+                fired = true;
+            });
+        "#)?;
+        rt.dispatch_dom_content_loaded()?;
+        let result = rt.eval("fired")?;
+        assert_eq!(result, QJsValue::Bool(true));
+        Ok(())
+    }
+
+    #[test]
+    fn local_storage_get_set() -> Result<(), JsError> {
+        let rt = JsRuntime::new(make_doc())?;
+        rt.eval("localStorage.setItem('key', 'value')")?;
+        let result = rt.eval("localStorage.getItem('key')")?;
+        assert_eq!(result, QJsValue::String("value".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn local_storage_remove() -> Result<(), JsError> {
+        let rt = JsRuntime::new(make_doc())?;
+        rt.eval("localStorage.setItem('x', '1')")?;
+        rt.eval("localStorage.removeItem('x')")?;
+        let result = rt.eval("localStorage.getItem('x')")?;
+        assert_eq!(result, QJsValue::Null);
+        Ok(())
+    }
+
+    #[test]
+    fn history_push_state_triggers_navigation() -> Result<(), JsError> {
+        let rt = JsRuntime::new(make_doc())?;
+        rt.eval("history.pushState(null, '', 'https://example.com/page')")?;
+        let nav = rt.pending_navigation.lock().unwrap().take();
+        assert_eq!(nav, Some("https://example.com/page".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn document_ready_state_starts_loading() -> Result<(), JsError> {
+        let rt = JsRuntime::new(make_doc())?;
+        let result = rt.eval("document.readyState")?;
+        assert_eq!(result, QJsValue::String("loading".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn document_ready_state_complete_after_dcl() -> Result<(), JsError> {
+        let rt = JsRuntime::new(make_doc())?;
+        rt.dispatch_dom_content_loaded()?;
+        let result = rt.eval("document.readyState")?;
+        assert_eq!(result, QJsValue::String("complete".to_string()));
         Ok(())
     }
 
