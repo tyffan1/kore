@@ -4,7 +4,7 @@ pub mod resources;
 pub mod theme;
 
 pub use resources::{settings_html, tabs_html, toolbar_html, NEWTAB_HTML};
-pub use theme::Theme;
+pub use theme::{ModernTheme, Theme};
 
 /// Platform-specific style for window control buttons (close/minimize/maximize).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

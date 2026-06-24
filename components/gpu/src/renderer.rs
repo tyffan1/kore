@@ -46,6 +46,7 @@ pub struct Renderer {
     font_cache: RefCell<FontCache>,
     font_id: FontId,
     glyph_texture_cache: RefCell<HashMap<(usize, char, u32), Arc<wgpu::BindGroup>>>,
+    font_family_map: HashMap<String, FontId>,
 }
 
 impl Renderer {
@@ -179,18 +180,9 @@ impl Renderer {
             ],
         });
 
-        #[cfg(target_os = "windows")]
-        const FONT_DATA: &[u8] = include_bytes!("C:/Windows/Fonts/arial.ttf");
-        #[cfg(target_os = "macos")]
-        const FONT_DATA: &[u8] = include_bytes!("/System/Library/Fonts/Helvetica.ttc");
-        #[cfg(target_os = "linux")]
-        const FONT_DATA: &[u8] = include_bytes!("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf");
-        let font_data: &[u8] = FONT_DATA;
+        // ── Font loading with platform-specific fonts ──
         let mut font_cache = FontCache::new();
-        let font_desc = FontDescription::new("Arial", false, false);
-        let font_id = font_cache
-            .load_font_bytes(font_data, font_desc)
-            .map_err(|e| GpuError::Font(e.to_string()))?;
+        let (font_id, font_family_map) = Self::load_platform_fonts(&mut font_cache)?;
 
         Ok(Self {
             device,
@@ -208,7 +200,90 @@ impl Renderer {
             font_cache: RefCell::new(font_cache),
             font_id,
             glyph_texture_cache: RefCell::new(HashMap::new()),
+            font_family_map,
         })
+    }
+
+    /// Load the best available font(s) for the current platform.
+    ///
+    /// Returns the primary font ID and a family→FontId map used for
+    /// per-`DrawText` font-family lookups.
+    fn load_platform_fonts(font_cache: &mut FontCache) -> Result<(FontId, HashMap<String, FontId>), GpuError> {
+        let mut family_map: HashMap<String, FontId> = HashMap::new();
+        let primary: FontId;
+
+        #[cfg(target_os = "macos")]
+        {
+            // Try SF Pro Text first, then SF Pro Display, then Helvetica
+            let candidates = [
+                ("/System/Library/Fonts/SFNSText.ttf", "SF Pro Text"),
+                ("/System/Library/Fonts/SFNS.ttf", "SF Pro Display"),
+                ("/System/Library/Fonts/Helvetica.ttc", "Helvetica Neue"),
+            ];
+
+            let mut loaded = false;
+            for (path, family) in &candidates {
+                if let Ok(data) = std::fs::read(path) {
+                    let desc = FontDescription::new(family, false, false);
+                    if let Ok(id) = font_cache.load_font_bytes(&data, desc) {
+                        family_map.insert(family.to_string(), id);
+                        if !loaded {
+                            primary = id;
+                            loaded = true;
+                        }
+                    }
+                }
+            }
+            if !loaded {
+                return Err(GpuError::Font("No fonts found on macOS".to_string()));
+            }
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            let data = include_bytes!("C:/Windows/Fonts/arial.ttf");
+            let desc = FontDescription::new("Arial", false, false);
+            let id = font_cache
+                .load_font_bytes(data, desc)
+                .map_err(|e| GpuError::Font(e.to_string()))?;
+            family_map.insert("Arial".to_string(), id);
+            primary = id;
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let data = include_bytes!("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf");
+            let desc = FontDescription::new("DejaVu Sans", false, false);
+            let id = font_cache
+                .load_font_bytes(data, desc)
+                .map_err(|e| GpuError::Font(e.to_string()))?;
+            family_map.insert("DejaVu Sans".to_string(), id);
+            primary = id;
+        }
+
+        #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+        compile_error!("Unsupported platform");
+
+        Ok((primary, family_map))
+    }
+
+    /// Resolve the best FontId for a given font-family hint.
+    ///
+    /// Falls back through the chain: family → "SF Pro Text" → "Helvetica Neue"
+    /// → "Arial" → "DejaVu Sans" → first loaded font.
+    fn resolve_font(&self, family: Option<&str>) -> FontId {
+        let fallback_chain = ["SF Pro Text", "SF Pro Display", "Helvetica Neue", "Arial", "DejaVu Sans"];
+        if let Some(f) = family {
+            if let Some(&id) = self.font_family_map.get(f) {
+                return id;
+            }
+        }
+        for name in &fallback_chain {
+            if let Some(&id) = self.font_family_map.get(*name) {
+                return id;
+            }
+        }
+        self.font_id
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -308,10 +383,11 @@ impl Renderer {
                     let color = [t.color.r, t.color.g, t.color.b, t.color.a];
                     let mut cursor_x = t.x;
                     let mut font_cache = self.font_cache.borrow_mut();
+                    let font_id = self.resolve_font(t.font_family.as_deref());
                     for ch in t.text.chars() {
-                        if let Some(glyph) = font_cache.rasterize_glyph(self.font_id, ch, t.font_size) {
+                        if let Some(glyph) = font_cache.rasterize_glyph(font_id, ch, t.font_size) {
                             if glyph.width > 0 && glyph.height > 0 {
-                                let cache_key = (self.font_id.0, ch, t.font_size.to_bits());
+                                let cache_key = (font_id.0, ch, t.font_size.to_bits());
                                 let bind_group = {
                                     let mut glyph_cache = self.glyph_texture_cache.borrow_mut();
                                     if let Some(cached) = glyph_cache.get(&cache_key) {
@@ -495,7 +571,7 @@ impl Renderer {
                 pass.set_vertex_buffer(0, vertex_buffer.slice(..));
                 pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 for draw in &frame.glyph_draws {
-                    pass.set_bind_group(1, &*draw.bind_group, &[]);
+                    pass.set_bind_group(1, &draw.bind_group, &[]);
                     pass.draw_indexed(draw.index_start..draw.index_start + draw.index_count, 0, 0..1);
                 }
             }

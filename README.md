@@ -62,6 +62,25 @@ cargo test --workspace
 cargo run
 ```
 
+## Windows development
+
+**AppLocker / Smart App Control**
+
+If `cargo test` fails with `os error 4551`, Windows security policy is blocking
+unsigned test executables in the local `target/` directory. All 205 tests pass
+on macOS; this is a Windows-environment-only issue.
+
+Solutions (pick one):
+
+- **Recommended** — uncomment the `target-dir` line in `.cargo/config.toml`
+  to redirect build output to `C:\Users\Public\kore-target` (the Public folder
+  is typically not restricted by AppLocker).
+- Run `cargo test` from a terminal launched **as Administrator**.
+- Temporarily disable **Smart App Control** in Windows Security settings.
+- Move the project to `C:\Users\Public\` or another unrestricted path.
+- Add the project's `target\` directory to **AppLocker exclusions** (via
+  Local Security Policy or group policy).
+
 ## Roadmap
 
 - Improved CSS rendering (flexbox edge cases, positioned elements)

@@ -71,7 +71,24 @@ impl JsRuntime {
         let mut ctx = self.context.borrow_mut();
         let source = Source::from_bytes(code);
         let result = ctx.eval(source).map_err(JsError::from)?;
-        Ok(boa_to_our_value(&result, &mut ctx))
+        let value = boa_to_our_value(&result, &mut ctx);
+        ctx.run_jobs();
+        Ok(value)
+    }
+
+    pub fn run_jobs(&self) -> Result<(), JsError> {
+        self.context.borrow_mut().run_jobs();
+        Ok(())
+    }
+
+    pub fn flush_timers(&self) -> Result<(), JsError> {
+        let mut ctx = self.context.borrow_mut();
+        ctx.eval(Source::from_bytes(
+            "while (__pending_timers.length > 0) { var fn = __pending_timers.shift(); if (typeof fn === 'function') { try { fn(); } catch(e) {} } }",
+        ))
+        .map_err(JsError::from)?;
+        ctx.run_jobs();
+        Ok(())
     }
 
     pub fn document(&self) -> Arc<Mutex<Document>> {
@@ -146,15 +163,96 @@ var console = {
             }
         }
 
+        let fetch_sync = NativeFunction::from_fn_ptr(|_, args, ctx| {
+            let url = args.first()
+                .and_then(|v| v.as_string())
+                .map(|s| s.to_std_string_escaped())
+                .unwrap_or_default();
+
+            let result = JsObject::with_null_proto();
+            if url.is_empty() || (!url.starts_with("http://") && !url.starts_with("https://")) {
+                result.set(JsString::from("status"), 0i32, false, ctx).ok();
+                result.set(JsString::from("ok"), false, false, ctx).ok();
+                result.set(JsString::from("body"), JsString::from(""), false, ctx).ok();
+                return Ok(BoaValue::Object(result));
+            }
+
+            let response = reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .user_agent("Mozilla/5.0 (compatible; Kore/0.1.0)")
+                .build()
+                .ok()
+                .and_then(|c| c.get(&url).send().ok());
+
+            match response {
+                Some(resp) => {
+                    let status = resp.status().as_u16() as i32;
+                    let ok = resp.status().is_success();
+                    let body = resp.text().unwrap_or_default();
+                    result.set(JsString::from("status"), status, false, ctx).ok();
+                    result.set(JsString::from("ok"), ok, false, ctx).ok();
+                    result.set(JsString::from("body"), JsString::from(body), false, ctx).ok();
+                }
+                None => {
+                    result.set(JsString::from("status"), 0i32, false, ctx).ok();
+                    result.set(JsString::from("ok"), false, false, ctx).ok();
+                    result.set(JsString::from("body"), JsString::from(""), false, ctx).ok();
+                }
+            }
+            Ok(BoaValue::Object(result))
+        });
+        ctx.register_global_callable(JsString::from("__fetch_sync"), 1, fetch_sync)
+            .map_err(|e| JsError::Context(e.to_string()))?;
+
         ctx.eval(Source::from_bytes(
             r#"
 var XMLHttpRequest = function() {
     this.readyState = 0;
     this.status = 0;
+    this.statusText = '';
     this.responseText = '';
-    this.open = function(method, url) { this._url = url; };
-    this.send = function() { this.readyState = 4; this.status = 200; };
-    this.setRequestHeader = function() {};
+    this.response = '';
+    this.onload = null;
+    this.onerror = null;
+    this.onreadystatechange = null;
+    this._method = 'GET';
+    this._url = '';
+    this._async = true;
+
+    this.open = function(method, url, async) {
+        this._method = method || 'GET';
+        this._url = url || '';
+        this._async = async !== false;
+        this.readyState = 1;
+    };
+
+    this.send = function(body) {
+        var self = this;
+        try {
+            var result = __fetch_sync(this._url);
+            self.readyState = 4;
+            self.status = result.status;
+            self.statusText = result.ok ? 'OK' : 'Error';
+            self.responseText = result.body;
+            self.response = result.body;
+            if (typeof self.onreadystatechange === 'function') {
+                self.onreadystatechange();
+            }
+            if (typeof self.onload === 'function') {
+                self.onload();
+            }
+        } catch(e) {
+            self.status = 0;
+            if (typeof self.onerror === 'function') {
+                self.onerror(e);
+            }
+        }
+    };
+
+    this.setRequestHeader = function(name, value) {};
+    this.getResponseHeader = function(name) { return null; };
+    this.getAllResponseHeaders = function() { return ''; };
+    this.abort = function() { this.readyState = 0; };
 };
 "#,
         ))
@@ -162,15 +260,100 @@ var XMLHttpRequest = function() {
 
         ctx.eval(Source::from_bytes(
             r#"
-window.fetch = function(url) {
-    return Promise.resolve({
-        ok: true,
-        status: 200,
-        text: function() { return Promise.resolve(''); },
-        json: function() { return Promise.resolve({}); }
+window.fetch = function(url, options) {
+    return new Promise(function(resolve, reject) {
+        try {
+            var result = __fetch_sync(url);
+            var bodyText = result.body;
+            var response = {
+                ok: result.ok,
+                status: result.status,
+                statusText: result.ok ? 'OK' : 'Error',
+                url: url,
+                headers: {
+                    get: function(name) { return null; }
+                },
+                text: function() {
+                    return Promise.resolve(bodyText);
+                },
+                json: function() {
+                    try {
+                        return Promise.resolve(JSON.parse(bodyText));
+                    } catch(e) {
+                        return Promise.reject(new Error('JSON parse error: ' + e.message));
+                    }
+                },
+                arrayBuffer: function() {
+                    return Promise.resolve(new ArrayBuffer(0));
+                },
+                blob: function() {
+                    return Promise.resolve({ size: bodyText.length, type: '' });
+                },
+                clone: function() { return this; }
+            };
+            resolve(response);
+        } catch(e) {
+            reject(new Error('fetch failed: ' + e.message));
+        }
     });
 };
-var fetch = window.fetch;
+var fetch = window.fetch;"#,
+        ))
+        .map_err(|e| JsError::Context(e.to_string()))?;
+
+        ctx.eval(Source::from_bytes(
+            r#"
+var __pending_timers = [];
+window.setTimeout = function(fn, delay) {
+    if (typeof fn === 'function') { __pending_timers.push(fn); }
+    return __pending_timers.length;
+};
+window.clearTimeout = function(id) {};
+window.setInterval = function(fn, delay) {
+    if (typeof fn === 'function') fn();
+    return 0;
+};
+window.clearInterval = function(id) {};
+var setTimeout = window.setTimeout;
+var clearTimeout = window.clearTimeout;
+var setInterval = window.setInterval;
+var clearInterval = window.clearInterval;
+"#,
+        ))
+        .map_err(|e| JsError::Context(e.to_string()))?;
+
+        ctx.eval(Source::from_bytes(
+            r#"
+window.requestAnimationFrame = function(fn) {
+    if (typeof fn === 'function') __pending_timers.push(fn);
+    return 0;
+};
+var requestAnimationFrame = window.requestAnimationFrame;
+window.cancelAnimationFrame = function() {};
+var cancelAnimationFrame = window.cancelAnimationFrame;
+window.performance = {
+    now: function() { return 0.0; },
+    mark: function() {},
+    measure: function() {},
+};
+var performance = window.performance;
+var MutationObserver = function(cb) {
+    this.observe = function() {};
+    this.disconnect = function() {};
+};
+var ResizeObserver = function(cb) {
+    this.observe = function() {};
+    this.disconnect = function() {};
+};
+var IntersectionObserver = function(cb, opts) {
+    this.observe = function() {};
+    this.disconnect = function() {};
+};
+var CustomEvent = function(type, opts) {
+    this.type = type;
+    this.detail = opts && opts.detail || null;
+    this.bubbles = opts && opts.bubbles || false;
+};
 "#,
         ))
         .map_err(|e| JsError::Context(e.to_string()))?;
@@ -1166,16 +1349,6 @@ fn build_window_object(ctx: &mut Context, nav_sink: &Arc<Mutex<Option<String>>>)
     win.set(JsString::from("location"), location_obj, false, ctx)
         .map_err(|e| JsError::Context(e.to_string()))?;
 
-    let set_timeout_fn = FunctionObjectBuilder::new(ctx.realm(), NativeFunction::from_fn_ptr(|_, _, _| Ok(BoaValue::Integer(0))))
-        .name("setTimeout").build();
-    win.set(JsString::from("setTimeout"), set_timeout_fn, false, ctx)
-        .map_err(|e| JsError::Context(e.to_string()))?;
-
-    let set_interval_fn = FunctionObjectBuilder::new(ctx.realm(), NativeFunction::from_fn_ptr(|_, _, _| Ok(BoaValue::Integer(0))))
-        .name("setInterval").build();
-    win.set(JsString::from("setInterval"), set_interval_fn, false, ctx)
-        .map_err(|e| JsError::Context(e.to_string()))?;
-
     let win_add_el_fn = FunctionObjectBuilder::new(ctx.realm(), NativeFunction::from_fn_ptr(|_, _, _| Ok(BoaValue::Undefined)))
         .name("addEventListener").build();
     win.set(JsString::from("addEventListener"), win_add_el_fn, false, ctx)
@@ -1761,6 +1934,46 @@ xhr.readyState;
     }
 
     #[test]
+    fn fetch_returns_response_object() -> Result<(), JsError> {
+        let rt = JsRuntime::new(make_doc())?;
+        let result = rt.eval(r#"
+            var p = fetch('https://nonexistent.invalid/');
+            typeof p.then === 'function'
+        "#)?;
+        assert_eq!(result, QJsValue::Bool(true));
+        Ok(())
+    }
+
+    #[test]
+    fn fetch_response_has_json_method() -> Result<(), JsError> {
+        let rt = JsRuntime::new(make_doc())?;
+        rt.eval(r#"
+            var resolved = false;
+            fetch('about:blank').then(function(r) {
+                resolved = typeof r.json === 'function';
+            });
+        "#)?;
+        rt.run_jobs()?;
+        let result = rt.eval("resolved")?;
+        assert_eq!(result, QJsValue::Bool(true));
+        Ok(())
+    }
+
+    #[test]
+    fn xhr_send_completes_synchronously() -> Result<(), JsError> {
+        let rt = JsRuntime::new(make_doc())?;
+        rt.eval(r#"
+            var xhr = new XMLHttpRequest();
+            xhr.open('GET', 'about:blank');
+            var loaded = false;
+            xhr.onload = function() { loaded = true; };
+            xhr.send();
+            loaded
+        "#)?;
+        Ok(())
+    }
+
+    #[test]
     fn query_selector_finds_by_id() -> Result<(), JsError> {
         let rt = JsRuntime::new(make_doc())?;
         rt.eval(r#"
@@ -1870,6 +2083,52 @@ xhr.readyState;
             returned.tagName;
         "#)?;
         assert_eq!(result, QJsValue::String("SPAN".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn promise_then_resolves() -> Result<(), JsError> {
+        let rt = JsRuntime::new(make_doc())?;
+        rt.eval(r#"
+            var resolved = false;
+            Promise.resolve(42).then(function(v) { resolved = v; });
+        "#)?;
+        rt.run_jobs()?;
+        let result = rt.eval("resolved")?;
+        assert_eq!(result, QJsValue::Int(42));
+        Ok(())
+    }
+
+    #[test]
+    fn set_timeout_queues_callback() -> Result<(), JsError> {
+        let rt = JsRuntime::new(make_doc())?;
+        rt.eval(r#"
+            var called = false;
+            setTimeout(function() { called = true; }, 0);
+        "#)?;
+        rt.flush_timers()?;
+        let result = rt.eval("called")?;
+        assert_eq!(result, QJsValue::Bool(true));
+        Ok(())
+    }
+
+    #[test]
+    fn map_and_set_are_available() -> Result<(), JsError> {
+        let rt = JsRuntime::new(make_doc())?;
+        let result = rt.eval(r#"
+            var m = new Map();
+            m.set('key', 'value');
+            m.get('key');
+        "#)?;
+        assert_eq!(result, QJsValue::String("value".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn weak_map_is_available() -> Result<(), JsError> {
+        let rt = JsRuntime::new(make_doc())?;
+        let result = rt.eval("typeof WeakMap")?;
+        assert_eq!(result, QJsValue::String("function".to_string()));
         Ok(())
     }
 }

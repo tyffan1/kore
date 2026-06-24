@@ -1,0 +1,23 @@
+# ── Windows AppLocker / Smart App Control workaround ──
+#
+# On Windows, `cargo test --workspace` (or building individual test binaries)
+# may fail with:
+#
+#   "Политика управления приложениями заблокировала этот файл"  (os error 4551)
+#
+# This is NOT a code bug — it means Windows security policy (AppLocker or Smart
+# App Control) is blocking unsigned test executables inside the local target/
+# directory.
+#
+# The fix below places the build output in a directory that is typically
+# excluded from AppLocker restrictions on Windows.  Uncomment and adjust the
+# path if you hit this error:
+#
+# [build]
+# target-dir = "C:\\Users\\Public\\kore-target"
+#
+# Alternative workarounds (pick one):
+#   • Run `cargo test` from a terminal launched as Administrator
+#   • Temporarily disable Smart App Control in Windows Security settings
+#   • Move the project to C:\Users\Public\ or another unrestricted path
+#   • Add the project's target\ directory to AppLocker exclusions
