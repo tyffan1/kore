@@ -54,6 +54,7 @@ pub struct RenderOutput {
     pub display_list: DisplayList,
     pub title: Option<String>,
     pub links: Vec<(f32, f32, f32, f32, String)>,
+    pub js_navigation: Option<String>,
 }
 
 /// The render pipeline: fetch HTML → parse → find CSS → fetch CSS → cascade → layout → display list.
@@ -83,37 +84,40 @@ impl Pipeline {
             let html_str = self.fetch_html(&current_url).await?;
             let document = Arc::new(std::sync::Mutex::new(parse_document(&html_str)?));
 
-            let js_runtime = kore_js::JsRuntime::new(document.clone())
-                .map_err(|e| PipelineError::Js(e.to_string()))?;
-            let scripts: Vec<String> = {
-                let d = document.lock().unwrap();
-                d.nodes().iter()
-                    .filter_map(|node| {
-                        if let kore_html::NodeKind::Element(el) = &node.kind {
-                            if el.tag_name.eq_ignore_ascii_case("script") {
-                                let script: String = node.children.iter()
-                                    .filter_map(|id| d.node(*id))
-                                    .filter_map(|n| if let kore_html::NodeKind::Text(t) = &n.kind {
-                                        Some(t.as_str())
-                                    } else { None })
-                                    .collect();
-                                if !script.trim().is_empty() {
-                                    return Some(script);
-                                }
+            let mut js_navigation: Option<String> = None;
+
+            if let Ok(js_runtime) = kore_js::JsRuntime::new(document.clone()) {
+                let entries = collect_script_entries({
+                    let d = document.lock().unwrap();
+                    d.clone()
+                });
+
+                for entry in &entries {
+                    match entry {
+                        ScriptEntry::Inline(content) => {
+                            let _ = js_runtime.eval(content);
+                            let _ = js_runtime.run_jobs();
+                        }
+                        ScriptEntry::External(url) => {
+                            if let Ok(body) = fetch_script_source(url) {
+                                let _ = js_runtime.eval(&body);
+                                let _ = js_runtime.run_jobs();
                             }
                         }
-                        None
-                    })
-                    .collect()
-            };
-            for script in &scripts {
-                let _ = js_runtime.eval(script);
-            }
+                    }
+                }
 
-            if let Some(redirect_url) = js_runtime.pending_navigation.lock().unwrap().take() {
-                if let Ok(new_url) = url::Url::parse(&redirect_url) {
-                    current_url = new_url;
-                    continue;
+                let _ = js_runtime.dispatch_dom_content_loaded();
+                let _ = js_runtime.flush_timers();
+
+                js_navigation = js_runtime.pending_navigation.lock().ok()
+                    .and_then(|mut nav| nav.take());
+
+                if let Some(ref nav_url) = js_navigation {
+                    if let Ok(new_url) = url::Url::parse(nav_url) {
+                        current_url = new_url;
+                        continue;
+                    }
                 }
             }
 
@@ -159,7 +163,7 @@ impl Pipeline {
                 (dl, links)
             };
 
-            return Ok(RenderOutput { display_list, title, links });
+            return Ok(RenderOutput { display_list, title, links, js_navigation });
         }
         Err(PipelineError::RedirectLimit)
     }
@@ -227,6 +231,98 @@ pub fn linked_stylesheets(document: &kore_html::Document, base: &Url) -> Vec<Url
         }
     }
     urls
+}
+
+/// A script found in the document, either inline or external.
+enum ScriptEntry {
+    Inline(String),
+    External(String),
+}
+
+/// Collect all `<script>` entries (inline content or external URL) from the document.
+fn collect_script_entries(document: kore_html::Document) -> Vec<ScriptEntry> {
+    let mut entries = Vec::new();
+    collect_scripts_recursive(&document, document.root(), &mut entries);
+    entries
+}
+
+fn collect_scripts_recursive(
+    document: &kore_html::Document,
+    node_id: kore_html::NodeId,
+    entries: &mut Vec<ScriptEntry>,
+) {
+    let node = match document.node(node_id) {
+        Some(n) => n,
+        None => return,
+    };
+
+    if let NodeKind::Element(el) = &node.kind {
+        if el.tag_name.eq_ignore_ascii_case("script") {
+            let has_src = el.attributes.iter().any(|a| a.name.eq_ignore_ascii_case("src"));
+            let script_type = el.attributes.iter()
+                .find(|a| a.name.eq_ignore_ascii_case("type"))
+                .map(|a| a.value.as_str())
+                .unwrap_or("text/javascript");
+
+            let is_js = script_type == "text/javascript"
+                || script_type == "application/javascript"
+                || script_type == "";
+
+            if is_js {
+                if !has_src {
+                    let content = get_script_text(document, node_id);
+                    if !content.trim().is_empty() {
+                        entries.push(ScriptEntry::Inline(content));
+                    }
+                } else if let Some(src) = el.attributes.iter()
+                    .find(|a| a.name.eq_ignore_ascii_case("src"))
+                    .map(|a| a.value.clone())
+                {
+                    if src.starts_with("http://") || src.starts_with("https://") || src.starts_with("//") {
+                        let full_url = if src.starts_with("//") {
+                            format!("https:{}", src)
+                        } else {
+                            src
+                        };
+                        entries.push(ScriptEntry::External(full_url));
+                    }
+                }
+            }
+        }
+    }
+
+    for &child_id in &node.children.clone() {
+        collect_scripts_recursive(document, child_id, entries);
+    }
+}
+
+fn get_script_text(document: &kore_html::Document, node_id: kore_html::NodeId) -> String {
+    let node = match document.node(node_id) {
+        Some(n) => n,
+        None => return String::new(),
+    };
+    let mut text = String::new();
+    for &child_id in &node.children {
+        if let Some(child) = document.node(child_id) {
+            if let NodeKind::Text(t) = &child.kind {
+                text.push_str(t);
+            }
+        }
+    }
+    text
+}
+
+fn fetch_script_source(url: &str) -> Result<String, String> {
+    reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .user_agent("Mozilla/5.0 (compatible; Kore/0.1.0)")
+        .build()
+        .map_err(|e| e.to_string())?
+        .get(url)
+        .send()
+        .map_err(|e| e.to_string())?
+        .text()
+        .map_err(|e| e.to_string())
 }
 
 /// Convert a CssColor (kore-css) to a Color (kore-gpu).
@@ -516,6 +612,65 @@ mod tests {
             }
         }
         texts
+    }
+
+    #[test]
+    fn test_script_tag_executes_and_modifies_dom() {
+        let doc = parse_document(r#"
+            <html><body>
+                <div id="target">original</div>
+                <script>
+                    var el = document.getElementById('target');
+                    if (el) el.setAttribute('data-modified', 'true');
+                </script>
+            </body></html>
+        "#).unwrap();
+        let entries = collect_script_entries(doc.clone());
+        assert!(!entries.is_empty(), "Should find script tag");
+        match &entries[0] {
+            ScriptEntry::Inline(content) => {
+                assert!(content.contains("getElementById"));
+            }
+            _ => panic!("expected inline script"),
+        }
+    }
+
+    #[test]
+    fn test_collect_scripts_finds_inline_scripts() {
+        let doc = parse_document(r#"<html><head>
+            <script>var x = 1;</script>
+            <script type="text/javascript">var y = 2;</script>
+            <script src="https://example.com/lib.js"></script>
+        </head></html>"#).unwrap();
+        let entries = collect_script_entries(doc);
+        assert_eq!(entries.len(), 3, "should find 2 inline + 1 external script");
+        match &entries[0] {
+            ScriptEntry::Inline(content) => assert!(content.contains("var x = 1")),
+            _ => panic!("expected inline script"),
+        }
+        match &entries[1] {
+            ScriptEntry::Inline(content) => assert!(content.contains("var y = 2")),
+            _ => panic!("expected inline script"),
+        }
+        match &entries[2] {
+            ScriptEntry::External(url) => assert_eq!(url, "https://example.com/lib.js"),
+            _ => panic!("expected external script"),
+        }
+    }
+
+    #[test]
+    fn test_script_type_filtering() {
+        let doc = parse_document(r#"<html><body>
+            <script type="text/javascript">var a = 1;</script>
+            <script type="text/css">.foo { color: red; }</script>
+            <script type="application/json">{"key": "value"}</script>
+        </body></html>"#).unwrap();
+        let entries = collect_script_entries(doc);
+        assert_eq!(entries.len(), 1, "should only execute text/javascript");
+        match &entries[0] {
+            ScriptEntry::Inline(content) => assert!(content.contains("var a = 1")),
+            _ => panic!("expected inline script"),
+        }
     }
 
     #[test]

@@ -1719,6 +1719,7 @@ dependencies = [
  "kore-js",
  "kore-layout",
  "kore-net",
+ "reqwest",
  "serde",
  "thiserror 1.0.69",
  "url",
