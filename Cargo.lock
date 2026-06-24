@@ -1678,9 +1678,10 @@ version = "0.1.0"
 dependencies = [
  "boa_engine",
  "kore-html",
+ "kore-net",
  "phf",
- "reqwest",
  "thiserror 1.0.69",
+ "tokio",
 ]
 
 [[package]]

@@ -254,18 +254,19 @@ var console = {
                 return Ok(BoaValue::Object(result));
             }
 
-            let response = reqwest::blocking::Client::builder()
-                .timeout(std::time::Duration::from_secs(10))
-                .user_agent("Mozilla/5.0 (compatible; Kore/0.1.0)")
-                .build()
-                .ok()
-                .and_then(|c| c.get(&url).send().ok());
+            let response = std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build().ok()?;
+                let client = kore_net::HttpClient::default();
+                let request = kore_net::FetchRequest::get(&url).ok()?;
+                rt.block_on(client.fetch(request)).ok().map(|r| {
+                    (r.status as i32, r.status < 400, String::from_utf8_lossy(&r.body).to_string())
+                })
+            }).join().ok().flatten();
 
             match response {
-                Some(resp) => {
-                    let status = resp.status().as_u16() as i32;
-                    let ok = resp.status().is_success();
-                    let body = resp.text().unwrap_or_default();
+                Some((status, ok, body)) => {
                     result.set(JsString::from("status"), status, false, ctx).ok();
                     result.set(JsString::from("ok"), ok, false, ctx).ok();
                     result.set(JsString::from("body"), JsString::from(body), false, ctx).ok();
