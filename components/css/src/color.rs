@@ -120,6 +120,10 @@ fn parse_named_color(name: &str) -> Option<CssColor> {
     })
 }
 
+pub fn parse_color(input: &str) -> Option<CssColor> {
+    CssColor::parse(input)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

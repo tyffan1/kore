@@ -9,7 +9,23 @@ pub enum Display {
     Inline,
     InlineBlock,
     Flex,
+    Grid,
     None,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Position {
+    Static,
+    Relative,
+    Absolute,
+    Fixed,
+    Sticky,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum GridTrack {
+    Fixed(f32),
+    Fraction(f32),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,6 +76,20 @@ pub struct ComputedStyle {
     pub margin: BoxEdges,
     pub border: BoxEdges,
     pub padding: BoxEdges,
+    pub position: Position,
+    pub top: Option<f32>,
+    pub right: Option<f32>,
+    pub bottom: Option<f32>,
+    pub left: Option<f32>,
+    pub grid_columns: Vec<GridTrack>,
+    pub grid_rows: Vec<GridTrack>,
+    pub grid_auto_rows: Option<f32>,
+    pub column_gap: f32,
+    pub row_gap: f32,
+    pub grid_column_start: Option<u16>,
+    pub grid_column_span: u16,
+    pub grid_row_start: Option<u16>,
+    pub grid_row_span: u16,
     pub background_color: Option<CssColor>,
     pub color: Option<CssColor>,
     pub font_size: Option<f32>,
@@ -80,6 +110,20 @@ impl Default for ComputedStyle {
             margin: BoxEdges::ZERO,
             border: BoxEdges::ZERO,
             padding: BoxEdges::ZERO,
+            position: Position::Static,
+            top: None,
+            right: None,
+            bottom: None,
+            left: None,
+            grid_columns: Vec::new(),
+            grid_rows: Vec::new(),
+            grid_auto_rows: None,
+            column_gap: 0.0,
+            row_gap: 0.0,
+            grid_column_start: None,
+            grid_column_span: 1,
+            grid_row_start: None,
+            grid_row_span: 1,
             background_color: None,
             color: None,
             font_size: None,
@@ -157,6 +201,45 @@ impl ComputedStyle {
                 _ => FlexWrap::NoWrap,
             };
         }
+
+        if let Some(value) = map.get("position") {
+            style.position = parse_position(value);
+        }
+        style.top = map.get("top").and_then(|value| parse_length(value));
+        style.right = map.get("right").and_then(|value| parse_length(value));
+        style.bottom = map.get("bottom").and_then(|value| parse_length(value));
+        style.left = map.get("left").and_then(|value| parse_length(value));
+
+        if let Some(value) = map.get("grid-template-columns") {
+            style.grid_columns = parse_grid_tracks(value);
+        }
+        if let Some(value) = map.get("grid-template-rows") {
+            style.grid_rows = parse_grid_tracks(value);
+        }
+        style.grid_auto_rows = map.get("grid-auto-rows").and_then(|value| parse_length(value));
+        if let Some(value) = map.get("column-gap") {
+            style.column_gap = parse_length(value).unwrap_or(0.0);
+        }
+        if let Some(value) = map.get("row-gap") {
+            style.row_gap = parse_length(value).unwrap_or(0.0);
+        }
+        if let Some(value) = map.get("gap") {
+            let mut parts = value.split_whitespace().filter_map(parse_length);
+            if let Some(first) = parts.next() {
+                style.row_gap = first;
+                style.column_gap = parts.next().unwrap_or(first);
+            }
+        }
+        if let Some(value) = map.get("grid-column") {
+            let (start, span) = parse_grid_placement(value);
+            style.grid_column_start = start;
+            style.grid_column_span = span;
+        }
+        if let Some(value) = map.get("grid-row") {
+            let (start, span) = parse_grid_placement(value);
+            style.grid_row_start = start;
+            style.grid_row_span = span;
+        }
         style
     }
 
@@ -177,8 +260,105 @@ fn parse_display(value: &str) -> Display {
         "inline" => Display::Inline,
         "inline-block" => Display::InlineBlock,
         "flex" | "inline-flex" => Display::Flex,
+        "grid" | "inline-grid" => Display::Grid,
         _ => Display::Block,
     }
+}
+
+fn parse_position(value: &str) -> Position {
+    match value {
+        "relative" => Position::Relative,
+        "absolute" => Position::Absolute,
+        "fixed" => Position::Fixed,
+        "sticky" => Position::Sticky,
+        _ => Position::Static,
+    }
+}
+
+/// Parse `grid-template-columns`/`grid-template-rows` values like
+/// `"100px 1fr"` or `"repeat(2, 50px 1fr)"` into track definitions.
+fn parse_grid_tracks(value: &str) -> Vec<GridTrack> {
+    split_grid_value(value)
+        .into_iter()
+        .filter_map(|token| parse_grid_track(&token))
+        .collect()
+}
+
+fn parse_grid_track(token: &str) -> Option<GridTrack> {
+    let token = token.trim();
+    if token.is_empty() || token == "auto" {
+        return None;
+    }
+    if let Some(fraction) = token.strip_suffix("fr") {
+        return fraction.trim().parse::<f32>().ok().map(GridTrack::Fraction);
+    }
+    parse_length(token).map(GridTrack::Fixed)
+}
+
+/// Split a track list into top-level tokens, keeping `repeat(...)` groups intact.
+fn split_grid_value(value: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0usize;
+    for ch in value.chars() {
+        match ch {
+            '(' => {
+                depth += 1;
+                current.push(ch);
+            }
+            ')' => {
+                depth = depth.saturating_sub(1);
+                current.push(ch);
+            }
+            ch if ch.is_ascii_whitespace() && depth == 0 => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            ch => current.push(ch),
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    let mut expanded = Vec::new();
+    for token in tokens {
+        if let Some((count, inner)) = parse_repeat(&token) {
+            let inner_tracks = split_grid_value(inner);
+            for _ in 0..count {
+                expanded.extend(inner_tracks.clone());
+            }
+        } else {
+            expanded.push(token);
+        }
+    }
+    expanded
+}
+
+/// Parse `repeat(N, <tracks>)` into `(count, inner_tracks)`.
+fn parse_repeat(token: &str) -> Option<(usize, &str)> {
+    let inner = token.strip_prefix("repeat(")?.strip_suffix(')')?;
+    let (count_str, tracks) = inner.split_once(',')?;
+    let count = count_str.trim().parse::<usize>().ok()?;
+    Some((count, tracks.trim()))
+}
+
+/// Parse `grid-column`/`grid-row` values like `"span 2"`, `"2"` or `"2 / span 3"`
+/// into `(start_index, span)`. Line numbers are converted to zero-based cell indices.
+fn parse_grid_placement(value: &str) -> (Option<u16>, u16) {
+    let mut start = None;
+    let mut span = 1u16;
+    for part in value.split('/') {
+        let tokens = part.split_whitespace().collect::<Vec<_>>();
+        if tokens.first() == Some(&"span") {
+            if let Some(n) = tokens.get(1).and_then(|t| t.parse::<u16>().ok()) {
+                span = n.max(1);
+            }
+        } else if let Some(n) = tokens.first().and_then(|t| t.parse::<u16>().ok()) {
+            start = Some(n.saturating_sub(1));
+        }
+    }
+    (start, span)
 }
 
 fn parse_edges(map: &BTreeMap<&str, &str>, prefix: &str) -> BoxEdges {

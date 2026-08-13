@@ -57,6 +57,10 @@ impl ExtensionManager {
         &self.api
     }
 
+    pub fn api_mut(&mut self) -> &mut ExtensionApi {
+        &mut self.api
+    }
+
     pub fn count(&self) -> usize {
         self.extensions.len()
     }

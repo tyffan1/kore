@@ -5,9 +5,9 @@ use std::sync::Arc;
 use wgpu::util::DeviceExt;
 
 use crate::{
-    display_list::{DisplayCommand, DisplayList},
+    display_list::{DisplayCommand, DisplayList, GpuImage},
     error::GpuError,
-    pipeline::{CirclePipeline, RectPipeline, TextPipeline},
+    pipeline::{CirclePipeline, ImageQuadPipeline, RectPipeline, TextPipeline},
     vertex::{circle_quad_vertices, rect_vertices, text_quad_vertices, CircleVertex, TextVertex, Vertex, RECT_INDICES},
 };
 
@@ -30,26 +30,68 @@ impl Default for RendererConfig {
     }
 }
 
-pub struct Renderer {
-    pub device: wgpu::Device,
-    pub queue: wgpu::Queue,
-    pub surface: wgpu::Surface<'static>,
-    pub surface_config: wgpu::SurfaceConfiguration,
+/// An offscreen render target used by the dedicated GPU process.
+#[derive(Debug, Clone)]
+pub struct OffscreenTarget {
+    pub texture: Arc<wgpu::Texture>,
+    pub view: Arc<wgpu::TextureView>,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Where a frame will be presented: an on-screen surface (browser process)
+/// or an offscreen texture (GPU process).
+pub enum FrameTarget {
+    Surface(wgpu::SurfaceTexture),
+    Offscreen(OffscreenTarget),
+}
+
+/// Outcome of finishing a frame.
+pub enum FrameResult {
+    /// The frame was presented to the window surface.
+    Presented,
+    /// The frame was rendered offscreen and read back as RGBA pixels.
+    Pixels(GpuImage),
+}
+
+/// Device resources shared by surface and offscreen renderers.
+struct CommonResources {
     rect_pipeline: RectPipeline,
     circle_pipeline: CirclePipeline,
     text_pipeline: TextPipeline,
+    image_pipeline: ImageQuadPipeline,
     viewport_buffer: wgpu::Buffer,
     viewport_bind_group: wgpu::BindGroup,
-    text_bind_group: wgpu::BindGroup,
+    placeholder_texture: wgpu::Texture,
+    placeholder_sampler: wgpu::Sampler,
+    font_cache: FontCache,
+    font_id: FontId,
+    font_family_map: HashMap<String, FontId>,
+}
+
+pub struct Renderer {
+    pub device: wgpu::Device,
+    pub queue: wgpu::Queue,
+    pub surface: Option<wgpu::Surface<'static>>,
+    pub surface_config: Option<wgpu::SurfaceConfiguration>,
+    offscreen: Option<OffscreenTarget>,
+    rect_pipeline: RectPipeline,
+    circle_pipeline: CirclePipeline,
+    text_pipeline: TextPipeline,
+    image_pipeline: ImageQuadPipeline,
+    viewport_buffer: wgpu::Buffer,
+    viewport_bind_group: wgpu::BindGroup,
     _placeholder_texture: wgpu::Texture,
-    _placeholder_sampler: wgpu::Sampler,
+    placeholder_sampler: wgpu::Sampler,
     font_cache: RefCell<FontCache>,
     font_id: FontId,
     glyph_texture_cache: RefCell<HashMap<(usize, char, u32), Arc<wgpu::BindGroup>>>,
+    image_texture_cache: RefCell<HashMap<u64, Arc<wgpu::BindGroup>>>,
     font_family_map: HashMap<String, FontId>,
 }
 
 impl Renderer {
+    /// Create a renderer that presents to a window surface.
     pub async fn new(
         instance: &wgpu::Instance,
         surface: wgpu::Surface<'static>,
@@ -96,11 +138,87 @@ impl Renderer {
         };
         surface.configure(&device, &surface_config);
 
-        let rect_pipeline = RectPipeline::new(&device, surface_format);
-        let circle_pipeline = CirclePipeline::new(&device, surface_format, &rect_pipeline.viewport_bind_group_layout);
-        let text_pipeline = TextPipeline::new(&device, surface_format);
+        let common = Self::init_common(&device, &queue, surface_format, config.width, config.height)?;
 
-        let viewport_data: [f32; 4] = [config.width as f32, config.height as f32, 0.0, 0.0];
+        let mut renderer = Self::from_common(common, device, queue);
+        renderer.surface = Some(surface);
+        renderer.surface_config = Some(surface_config);
+        Ok(renderer)
+    }
+
+    /// Create a renderer with no window surface, targeting an offscreen
+    /// texture that can be read back as RGBA pixels. Used by the dedicated
+    /// GPU process.
+    pub async fn new_offscreen(
+        instance: &wgpu::Instance,
+        config: RendererConfig,
+    ) -> Result<Self, GpuError> {
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: None,
+                force_fallback_adapter: false,
+            })
+            .await
+            .ok_or(GpuError::NoAdapter)?;
+
+        let (device, queue) = adapter
+            .request_device(
+                &wgpu::DeviceDescriptor {
+                    label: None,
+                    required_features: wgpu::Features::empty(),
+                    required_limits: wgpu::Limits::default(),
+                    memory_hints: wgpu::MemoryHints::default(),
+                },
+                None,
+            )
+            .await?;
+
+        let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let common = Self::init_common(&device, &queue, format, config.width, config.height)?;
+
+        let mut renderer = Self::from_common(common, device, queue);
+        renderer.offscreen = Some(Self::create_offscreen_target(&renderer.device, config.width, config.height));
+        Ok(renderer)
+    }
+
+    fn from_common(common: CommonResources, device: wgpu::Device, queue: wgpu::Queue) -> Self {
+        Self {
+            device,
+            queue,
+            surface: None,
+            surface_config: None,
+            offscreen: None,
+            rect_pipeline: common.rect_pipeline,
+            circle_pipeline: common.circle_pipeline,
+            text_pipeline: common.text_pipeline,
+            image_pipeline: common.image_pipeline,
+            viewport_buffer: common.viewport_buffer,
+            viewport_bind_group: common.viewport_bind_group,
+            _placeholder_texture: common.placeholder_texture,
+            placeholder_sampler: common.placeholder_sampler,
+            font_cache: RefCell::new(common.font_cache),
+            font_id: common.font_id,
+            glyph_texture_cache: RefCell::new(HashMap::new()),
+            image_texture_cache: RefCell::new(HashMap::new()),
+            font_family_map: common.font_family_map,
+        }
+    }
+
+    /// Create the device-independent resources (pipelines, buffers, fonts).
+    fn init_common(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        format: wgpu::TextureFormat,
+        width: u32,
+        height: u32,
+    ) -> Result<CommonResources, GpuError> {
+        let rect_pipeline = RectPipeline::new(device, format);
+        let circle_pipeline = CirclePipeline::new(device, format, &rect_pipeline.viewport_bind_group_layout);
+        let text_pipeline = TextPipeline::new(device, format);
+        let image_pipeline = ImageQuadPipeline::new(device, format);
+
+        let viewport_data: [f32; 4] = [width as f32, height as f32, 0.0, 0.0];
         let viewport_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None,
             contents: bytemuck::cast_slice(&viewport_data),
@@ -131,8 +249,6 @@ impl Renderer {
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
-
-        let placeholder_view = placeholder_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         let placeholder_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: None,
@@ -165,43 +281,47 @@ impl Renderer {
             },
         );
 
-        let text_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &text_pipeline.texture_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&placeholder_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&placeholder_sampler),
-                },
-            ],
-        });
-
         // ── Font loading with platform-specific fonts ──
         let mut font_cache = FontCache::new();
         let (font_id, font_family_map) = Self::load_platform_fonts(&mut font_cache)?;
 
-        Ok(Self {
-            device,
-            queue,
-            surface,
-            surface_config,
+        Ok(CommonResources {
             rect_pipeline,
             circle_pipeline,
             text_pipeline,
+            image_pipeline,
             viewport_buffer,
             viewport_bind_group,
-            text_bind_group,
-            _placeholder_texture: placeholder_texture,
-            _placeholder_sampler: placeholder_sampler,
-            font_cache: RefCell::new(font_cache),
+            placeholder_texture,
+            placeholder_sampler,
+            font_cache,
             font_id,
-            glyph_texture_cache: RefCell::new(HashMap::new()),
             font_family_map,
         })
+    }
+
+    fn create_offscreen_target(device: &wgpu::Device, width: u32, height: u32) -> OffscreenTarget {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width: width.max(1),
+                height: height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        OffscreenTarget {
+            texture: Arc::new(texture),
+            view: Arc::new(view),
+            width: width.max(1),
+            height: height.max(1),
+        }
     }
 
     /// Load the best available font(s) for the current platform.
@@ -290,9 +410,15 @@ impl Renderer {
         if width == 0 || height == 0 {
             return;
         }
-        self.surface_config.width = width;
-        self.surface_config.height = height;
-        self.surface.configure(&self.device, &self.surface_config);
+        if let Some(surface) = &self.surface {
+            if let Some(config) = &mut self.surface_config {
+                config.width = width;
+                config.height = height;
+                surface.configure(&self.device, config);
+            }
+        } else if let Some(target) = &mut self.offscreen {
+            *target = Self::create_offscreen_target(&self.device, width, height);
+        }
 
         let viewport_data: [f32; 4] = [width as f32, height as f32, 0.0, 0.0];
         self.queue.write_buffer(
@@ -303,16 +429,24 @@ impl Renderer {
     }
 
     pub fn begin_frame(&self) -> Result<FrameRenderer, GpuError> {
-        let surface_texture = match self.surface.get_current_texture() {
-            Err(wgpu::SurfaceError::Outdated) | Err(wgpu::SurfaceError::Lost) => {
-                self.surface
-                    .configure(&self.device, &self.surface_config);
-                self.surface.get_current_texture()?
-            }
-            other => other?,
+        let target = if let Some(surface) = &self.surface {
+            let surface_texture = match surface.get_current_texture() {
+                Err(wgpu::SurfaceError::Outdated) | Err(wgpu::SurfaceError::Lost) => {
+                    if let Some(config) = &self.surface_config {
+                        surface.configure(&self.device, config);
+                    }
+                    surface.get_current_texture()?
+                }
+                other => other?,
+            };
+            FrameTarget::Surface(surface_texture)
+        } else if let Some(target) = &self.offscreen {
+            FrameTarget::Offscreen(target.clone())
+        } else {
+            return Err(GpuError::NoSurface);
         };
         Ok(FrameRenderer {
-            surface_texture,
+            target,
             rect_vertices: Vec::new(),
             rect_indices: Vec::new(),
             circle_vertices: Vec::new(),
@@ -320,6 +454,9 @@ impl Renderer {
             text_vertices: Vec::new(),
             text_indices: Vec::new(),
             glyph_draws: Vec::new(),
+            image_vertices: Vec::new(),
+            image_indices: Vec::new(),
+            image_draws: Vec::new(),
         })
     }
 
@@ -421,7 +558,7 @@ impl Renderer {
                                             layout: &self.text_pipeline.texture_bind_group_layout,
                                             entries: &[
                                                 wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
-                                                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self._placeholder_sampler) },
+                                                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.placeholder_sampler) },
                                             ],
                                         });
                                         let arc_bg = Arc::new(bind_group);
@@ -462,25 +599,140 @@ impl Renderer {
                 DisplayCommand::PopClip => {
                     clip_stack.pop();
                 }
-                DisplayCommand::Image(_) => {}
+                DisplayCommand::Image(im) => {
+                    if im.width <= 0.0 || im.height <= 0.0 {
+                        continue;
+                    }
+                    if let Some(clip) = clip_stack.last() {
+                        let rect_clip = crate::display_list::ClipRect {
+                            x: im.x,
+                            y: im.y,
+                            width: im.width,
+                            height: im.height,
+                        };
+                        if !clip.intersects(&rect_clip) {
+                            continue;
+                        }
+                        if im.y + im.height < clip.y || im.y > clip.y + clip.height {
+                            continue;
+                        }
+                    }
+                    let image = &im.image;
+                    if image.width == 0 || image.height == 0 {
+                        continue;
+                    }
+                    let expected = image.width as usize * image.height as usize * 4;
+                    if image.pixels.len() != expected {
+                        continue;
+                    }
+                    let key = image_cache_key(image);
+                    let bind_group = {
+                        let mut cache = self.image_texture_cache.borrow_mut();
+                        if let Some(cached) = cache.get(&key) {
+                            cached.clone()
+                        } else {
+                            let bind_group = self.upload_image_texture(image);
+                            if let Some(bind_group) = bind_group {
+                                cache.insert(key, bind_group.clone());
+                                bind_group
+                            } else {
+                                continue;
+                            }
+                        }
+                    };
+                    let base = frame.image_vertices.len() as u16;
+                    let verts = text_quad_vertices(im.x, im.y, im.width, im.height, 0.0, 0.0, 1.0, 1.0, [1.0, 1.0, 1.0, 1.0]);
+                    frame.image_vertices.extend_from_slice(&verts);
+                    let index_base = frame.image_indices.len() as u32;
+                    for &i in &RECT_INDICES {
+                        frame.image_indices.push(base as u32 + i as u32);
+                    }
+                    frame.image_draws.push(GlyphDraw { index_start: index_base, index_count: 6, bind_group });
+                }
             }
         }
     }
 
-    pub fn end_frame(&self, frame: FrameRenderer) -> Result<(), GpuError> {
+    /// Upload RGBA pixels into a texture and return a bind group for it.
+    fn upload_image_texture(&self, image: &GpuImage) -> Option<Arc<wgpu::BindGroup>> {
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width: image.width,
+                height: image.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &image.pixels,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(image.width * 4),
+                rows_per_image: Some(image.height),
+            },
+            wgpu::Extent3d {
+                width: image.width,
+                height: image.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &self.image_pipeline.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.placeholder_sampler),
+                },
+            ],
+        });
+        Some(Arc::new(bind_group))
+    }
+
+    /// Finish a frame. For offscreen renderers the pixels are read back
+    /// into a [`GpuImage`].
+    pub async fn end_frame(&self, frame: FrameRenderer) -> Result<FrameResult, GpuError> {
         let rect_empty = frame.rect_vertices.is_empty();
         let circle_empty = frame.circle_vertices.is_empty();
         let text_empty = frame.text_vertices.is_empty();
 
-        if rect_empty && circle_empty && text_empty {
-            frame.surface_texture.present();
-            return Ok(());
+        let is_surface = matches!(&frame.target, FrameTarget::Surface(_));
+
+        if rect_empty && circle_empty && text_empty && is_surface {
+            match frame.target {
+                FrameTarget::Surface(st) => st.present(),
+                FrameTarget::Offscreen(_) => {}
+            }
+            return Ok(FrameResult::Presented);
         }
 
-        let view = frame
-            .surface_texture
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
+        let view = match &frame.target {
+            FrameTarget::Surface(st) => {
+                st.texture
+                    .create_view(&wgpu::TextureViewDescriptor::default())
+            }
+            FrameTarget::Offscreen(t) => {
+                t.texture
+                    .create_view(&wgpu::TextureViewDescriptor::default())
+            }
+        };
 
         let mut encoder =
             self.device
@@ -581,12 +833,117 @@ impl Renderer {
                     pass.draw_indexed(draw.index_start..draw.index_start + draw.index_count, 0, 0..1);
                 }
             }
+
+            if !frame.image_vertices.is_empty() {
+                let vertex_buffer =
+                    self.device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: None,
+                            contents: bytemuck::cast_slice(&frame.image_vertices),
+                            usage: wgpu::BufferUsages::VERTEX,
+                        });
+
+                let index_buffer =
+                    self.device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: None,
+                            contents: bytemuck::cast_slice(&frame.image_indices),
+                            usage: wgpu::BufferUsages::INDEX,
+                        });
+
+                pass.set_pipeline(&self.image_pipeline.pipeline);
+                pass.set_bind_group(0, &self.viewport_bind_group, &[]);
+                pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+                pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                for draw in &frame.image_draws {
+                    pass.set_bind_group(1, &draw.bind_group, &[]);
+                    pass.draw_indexed(draw.index_start..draw.index_start + draw.index_count, 0, 0..1);
+                }
+            }
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
-        frame.surface_texture.present();
 
-        Ok(())
+        match frame.target {
+            FrameTarget::Surface(st) => {
+                st.present();
+                Ok(FrameResult::Presented)
+            }
+            FrameTarget::Offscreen(t) => {
+                let bytes_per_pixel = 4u32;
+                let bytes_per_row = t.width * bytes_per_pixel;
+                let padded_row = bytes_per_row.div_ceil(256) * 256;
+                let buffer_size = (padded_row * t.height) as u64;
+
+                let output_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: None,
+                    size: buffer_size,
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                });
+
+                let mut copy_encoder = self.device.create_command_encoder(
+                    &wgpu::CommandEncoderDescriptor { label: None },
+                );
+                copy_encoder.copy_texture_to_buffer(
+                    wgpu::ImageCopyTexture {
+                        texture: &t.texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::ImageCopyBuffer {
+                        buffer: &output_buffer,
+                        layout: wgpu::ImageDataLayout {
+                            offset: 0,
+                            bytes_per_row: Some(padded_row),
+                            rows_per_image: Some(t.height),
+                        },
+                    },
+                    wgpu::Extent3d {
+                        width: t.width,
+                        height: t.height,
+                        depth_or_array_layers: 1,
+                    },
+                );
+                self.queue.submit(std::iter::once(copy_encoder.finish()));
+
+                let slice = output_buffer.slice(..);
+                let (map_tx, map_rx) = std::sync::mpsc::channel();
+                slice.map_async(wgpu::MapMode::Read, move |result| {
+                    let _ = map_tx.send(result);
+                });
+                self.device.poll(wgpu::Maintain::Wait);
+
+                map_rx
+                    .recv()
+                    .map_err(|_| GpuError::Readback("map channel closed".into()))?
+                    .map_err(|e| GpuError::Readback(e.to_string()))?;
+
+                let mapped = slice.get_mapped_range();
+                let mut pixels = Vec::with_capacity((bytes_per_row * t.height) as usize);
+                for row in 0..t.height as usize {
+                    let start = row * padded_row as usize;
+                    pixels.extend_from_slice(&mapped[start..start + bytes_per_row as usize]);
+                }
+
+                Ok(FrameResult::Pixels(GpuImage {
+                    width: t.width,
+                    height: t.height,
+                    pixels,
+                }))
+            }
+        }
+    }
+
+    /// Render a display list offscreen and return the RGBA pixels.
+    pub async fn render_to_image(&self, list: &DisplayList) -> Result<GpuImage, GpuError> {
+        let mut frame = self.begin_frame()?;
+        self.submit(&mut frame, list);
+        match self.end_frame(frame).await? {
+            FrameResult::Pixels(image) => Ok(image),
+            FrameResult::Presented => Err(GpuError::SurfaceOnly),
+        }
     }
 }
 
@@ -597,7 +954,7 @@ struct GlyphDraw {
 }
 
 pub struct FrameRenderer {
-    pub(crate) surface_texture: wgpu::SurfaceTexture,
+    pub(crate) target: FrameTarget,
     pub(crate) rect_vertices: Vec<Vertex>,
     pub(crate) rect_indices: Vec<u16>,
     pub(crate) circle_vertices: Vec<CircleVertex>,
@@ -605,4 +962,28 @@ pub struct FrameRenderer {
     pub(crate) text_vertices: Vec<TextVertex>,
     pub(crate) text_indices: Vec<u32>,
     glyph_draws: Vec<GlyphDraw>,
+    image_vertices: Vec<TextVertex>,
+    image_indices: Vec<u32>,
+    image_draws: Vec<GlyphDraw>,
+}
+
+/// FNV-1a hash of the RGBA payload; identical pixel buffers share one texture.
+fn image_cache_key(image: &GpuImage) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    let mut mix = |byte: u8| {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    };
+    mix((image.width & 0xff) as u8);
+    mix(((image.width >> 8) & 0xff) as u8);
+    mix((image.width >> 16) as u8);
+    mix((image.width >> 24) as u8);
+    mix((image.height & 0xff) as u8);
+    mix(((image.height >> 8) & 0xff) as u8);
+    mix((image.height >> 16) as u8);
+    mix((image.height >> 24) as u8);
+    for byte in &image.pixels {
+        mix(*byte);
+    }
+    hash
 }

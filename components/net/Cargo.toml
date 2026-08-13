@@ -8,6 +8,10 @@ rust-version.workspace = true
 [lib]
 path = "src/lib.rs"
 
+[[bin]]
+name = "kore-network"
+path = "src/bin/kore_network.rs"
+
 [lints]
 workspace = true
 
@@ -17,7 +21,11 @@ http-body-util.workspace = true
 hyper.workspace = true
 hyper-rustls.workspace = true
 hyper-util.workspace = true
+kore-ipc = { path = "../ipc" }
 serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 url.workspace = true
+
+[dev-dependencies]
+bincode.workspace = true

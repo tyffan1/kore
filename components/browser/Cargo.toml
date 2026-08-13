@@ -12,6 +12,7 @@ path = "src/lib.rs"
 workspace = true
 
 [dependencies]
+kore-gpu = { path = "../gpu" }
 kore-ipc = { path = "../ipc" }
 kore-net = { path = "../net" }
 kore-sandbox = { path = "../sandbox" }

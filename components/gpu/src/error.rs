@@ -26,4 +26,20 @@ pub enum GpuError {
     /// Font loading or glyph rasterization failed.
     #[error("font error: {0}")]
     Font(String),
+
+    /// An offscreen (GPU-process) render target was expected but absent.
+    #[error("offscreen render target is not configured")]
+    NoOffscreenTarget,
+
+    /// A surface was expected but the renderer is in offscreen mode.
+    #[error("renderer has no surface")]
+    NoSurface,
+
+    /// Readback of an offscreen frame failed.
+    #[error("frame readback failed: {0}")]
+    Readback(String),
+
+    /// The renderer is in surface mode but an offscreen operation was requested.
+    #[error("offscreen operation requires an offscreen renderer")]
+    SurfaceOnly,
 }

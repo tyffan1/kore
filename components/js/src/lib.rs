@@ -1,8 +1,12 @@
 #![allow(unsafe_code)]
 
+pub mod storage;
+
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+
+pub use storage::{Cookie, CookieJar, SharedCookieJar, SharedStorage, WebStorage};
 
 use boa_engine::error::JsError as BoaJsError;
 use boa_engine::native_function::NativeFunction;
@@ -49,10 +53,26 @@ pub struct JsRuntime {
     document: Arc<Mutex<Document>>,
     pub pending_navigation: Arc<Mutex<Option<String>>>,
     pub dom_state: Arc<Mutex<DomState>>,
+    pub storage: SharedStorage,
+    pub cookies: SharedCookieJar,
 }
 
 impl JsRuntime {
     pub fn new(document: Arc<Mutex<Document>>) -> Result<Self, JsError> {
+        Self::with_shared_storage(
+            document,
+            Arc::new(Mutex::new(WebStorage::default())),
+            Arc::new(Mutex::new(CookieJar::default())),
+        )
+    }
+
+    /// Create a runtime backed by storage shared across the session, so
+    /// `localStorage` and `document.cookie` survive page navigation.
+    pub fn with_shared_storage(
+        document: Arc<Mutex<Document>>,
+        storage: SharedStorage,
+        cookies: SharedCookieJar,
+    ) -> Result<Self, JsError> {
         let context = Context::default();
         let rt = Self {
             context: RefCell::new(context),
@@ -62,6 +82,8 @@ impl JsRuntime {
                 inline_styles: HashMap::new(),
                 event_listeners: HashMap::new(),
             })),
+            storage,
+            cookies,
         };
         rt.init_bindings()?;
         Ok(rt)
@@ -212,7 +234,13 @@ var console = {
         ctx.register_global_callable(JsString::from("__window_location_set_href"), 1, set_href_fn)
             .map_err(|e| JsError::Context(e.to_string()))?;
 
-        let document_obj = build_document_object(&mut ctx, &doc, &self.pending_navigation, &dom_state)?;
+        let document_obj = build_document_object(
+            &mut ctx,
+            &doc,
+            &self.pending_navigation,
+            &dom_state,
+            &self.cookies,
+        )?;
         ctx.register_global_property(JsString::from("document"), document_obj.clone(), Attribute::all())
             .map_err(|e| JsError::Context(e.to_string()))?;
 
@@ -393,28 +421,102 @@ window.dispatchEvent = function(event) {
         ))
         .map_err(|e| JsError::Context(e.to_string()))?;
 
+        let storage = self.storage.clone();
+        let storage_get_item = unsafe {
+            NativeFunction::from_closure(move |_, args, _| {
+                let key = args
+                    .first()
+                    .and_then(|v| v.as_string())
+                    .map(|s| s.to_std_string_escaped())
+                    .unwrap_or_default();
+                let s = storage.lock().unwrap();
+                match s.get(&key) {
+                    Some(v) => Ok(BoaValue::String(JsString::from(v))),
+                    None => Ok(BoaValue::Null),
+                }
+            })
+        };
+        ctx.register_global_callable(JsString::from("__storage_get_item"), 1, storage_get_item)
+            .map_err(|e| JsError::Context(e.to_string()))?;
+
+        let storage = self.storage.clone();
+        let storage_set_item = unsafe {
+            NativeFunction::from_closure(move |_, args, _| {
+                let key = args
+                    .first()
+                    .and_then(|v| v.as_string())
+                    .map(|s| s.to_std_string_escaped())
+                    .unwrap_or_default();
+                let value = args
+                    .get(1)
+                    .and_then(|v| v.as_string())
+                    .map(|s| s.to_std_string_escaped())
+                    .unwrap_or_default();
+                storage.lock().unwrap().set(key, value);
+                Ok(BoaValue::Undefined)
+            })
+        };
+        ctx.register_global_callable(JsString::from("__storage_set_item"), 2, storage_set_item)
+            .map_err(|e| JsError::Context(e.to_string()))?;
+
+        let storage = self.storage.clone();
+        let storage_remove_item = unsafe {
+            NativeFunction::from_closure(move |_, args, _| {
+                let key = args
+                    .first()
+                    .and_then(|v| v.as_string())
+                    .map(|s| s.to_std_string_escaped())
+                    .unwrap_or_default();
+                storage.lock().unwrap().remove(&key);
+                Ok(BoaValue::Undefined)
+            })
+        };
+        ctx.register_global_callable(JsString::from("__storage_remove_item"), 1, storage_remove_item)
+            .map_err(|e| JsError::Context(e.to_string()))?;
+
+        let storage = self.storage.clone();
+        let storage_clear = unsafe {
+            NativeFunction::from_closure(move |_, _, _| {
+                storage.lock().unwrap().clear();
+                Ok(BoaValue::Undefined)
+            })
+        };
+        ctx.register_global_callable(JsString::from("__storage_clear"), 0, storage_clear)
+            .map_err(|e| JsError::Context(e.to_string()))?;
+
+        let storage = self.storage.clone();
+        let storage_length = unsafe {
+            NativeFunction::from_closure(move |_, _, _| {
+                let len = storage.lock().unwrap().len();
+                Ok(BoaValue::Integer(len as i32))
+            })
+        };
+        ctx.register_global_callable(JsString::from("__storage_length"), 0, storage_length)
+            .map_err(|e| JsError::Context(e.to_string()))?;
+
+        let storage = self.storage.clone();
+        let storage_key = unsafe {
+            NativeFunction::from_closure(move |_, args, ctx| {
+                let index = args.first().and_then(|v| v.to_i32(ctx).ok()).unwrap_or(-1);
+                let s = storage.lock().unwrap();
+                match s.key_at(index as usize) {
+                    Some(k) => Ok(BoaValue::String(JsString::from(k.as_str()))),
+                    None => Ok(BoaValue::Null),
+                }
+            })
+        };
+        ctx.register_global_callable(JsString::from("__storage_key"), 1, storage_key)
+            .map_err(|e| JsError::Context(e.to_string()))?;
+
         ctx.eval(Source::from_bytes(
             r#"
-var __localStorage = {};
 var localStorage = {
-    getItem: function(key) {
-        return __localStorage.hasOwnProperty(key) ? __localStorage[key] : null;
-    },
-    setItem: function(key, value) {
-        __localStorage[key] = String(value);
-    },
-    removeItem: function(key) {
-        delete __localStorage[key];
-    },
-    clear: function() {
-        __localStorage = {};
-    },
-    get length() {
-        return Object.keys(__localStorage).length;
-    },
-    key: function(index) {
-        return Object.keys(__localStorage)[index] || null;
-    }
+    getItem: function(key) { return __storage_get_item(key); },
+    setItem: function(key, value) { __storage_set_item(key, String(value)); },
+    removeItem: function(key) { __storage_remove_item(key); },
+    clear: function() { __storage_clear(); },
+    get length() { return __storage_length(); },
+    key: function(index) { return __storage_key(index); }
 };
 window.localStorage = localStorage;
 
@@ -531,8 +633,82 @@ fn build_document_object(
     doc: &Arc<Mutex<Document>>,
     nav_sink: &Arc<Mutex<Option<String>>>,
     dom_state: &Arc<Mutex<DomState>>,
+    cookies: &SharedCookieJar,
 ) -> Result<JsObject, JsError> {
     let document_obj = JsObject::with_null_proto();
+
+    // document.cookie
+    let cookie_getter = {
+        let cookies = cookies.clone();
+        unsafe {
+            NativeFunction::from_closure(move |_, _, _| {
+                let jar = cookies.lock().unwrap();
+                let joined = jar
+                    .all()
+                    .iter()
+                    .map(|c| format!("{}={}", c.name, c.value))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                Ok(BoaValue::String(JsString::from(joined)))
+            })
+        }
+    };
+    let cookie_setter = {
+        let cookies = cookies.clone();
+        unsafe {
+            NativeFunction::from_closure(move |_, args, _| {
+                let input = args
+                    .first()
+                    .and_then(|v| v.as_string())
+                    .map(|s| s.to_std_string_escaped())
+                    .unwrap_or_default();
+                let mut name = String::new();
+                let mut value = String::new();
+                let mut path = String::from("/");
+                let mut domain = String::new();
+                for (i, part) in input.split(';').enumerate() {
+                    let part = part.trim();
+                    if let Some(eq) = part.find('=') {
+                        let key = part[..eq].trim();
+                        let val = part[eq + 1..].trim();
+                        if i == 0 {
+                            name = key.to_string();
+                            value = val.to_string();
+                        } else {
+                            match key.to_ascii_lowercase().as_str() {
+                                "path" => path = val.to_string(),
+                                "domain" => domain = val.to_string(),
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                let mut jar = cookies.lock().unwrap();
+                if value.is_empty() {
+                    jar.remove(&name, Some(&domain), Some(&path));
+                } else {
+                    jar.set(crate::storage::Cookie { name, value, domain, path });
+                }
+                Ok(BoaValue::Undefined)
+            })
+        }
+    };
+    let cookie_getter_obj = FunctionObjectBuilder::new(ctx.realm(), cookie_getter)
+        .name("get cookie").length(0).build();
+    let cookie_setter_obj = FunctionObjectBuilder::new(ctx.realm(), cookie_setter)
+        .name("set cookie").length(1).build();
+    document_obj
+        .define_property_or_throw(
+            JsString::from("cookie"),
+            PropertyDescriptor::builder()
+                .get(cookie_getter_obj)
+                .set(cookie_setter_obj)
+                .enumerable(true)
+                .configurable(true)
+                .build(),
+            ctx,
+        )
+        .map_err(|e| JsError::Context(e.to_string()))?;
 
     document_obj
         .set(JsString::from("__kore_node_id"), 0i32, false, ctx)
@@ -951,10 +1127,70 @@ fn create_element_object(
             };
             let text_getter_obj = FunctionObjectBuilder::new(ctx.realm(), text_getter)
                 .name("get textContent").length(0).build();
+            let text_setter = {
+                let doc = doc.clone();
+                let nid = node_id;
+                unsafe {
+                    NativeFunction::from_closure(move |_, args, _| {
+                        let value = args.first()
+                            .and_then(|v| v.as_string())
+                            .map(|s| s.to_std_string_escaped())
+                            .unwrap_or_default();
+                        let mut d = doc.lock().unwrap();
+                        set_text_content(&mut d, nid, &value);
+                        Ok(BoaValue::Undefined)
+                    })
+                }
+            };
+            let text_setter_obj = FunctionObjectBuilder::new(ctx.realm(), text_setter)
+                .name("set textContent").length(1).build();
             obj.define_property_or_throw(
                 JsString::from("textContent"),
                 PropertyDescriptor::builder()
                     .get(text_getter_obj)
+                    .set(text_setter_obj)
+                    .enumerable(true)
+                    .configurable(true)
+                    .build(),
+                ctx,
+            ).ok()?;
+
+            // innerText (getter and setter, same semantics as textContent)
+            let inner_getter = {
+                let doc = doc.clone();
+                let nid = node_id;
+                unsafe {
+                    NativeFunction::from_closure(move |_, _, _| {
+                        let d = doc.lock().unwrap();
+                        let text = get_text_content(&d, nid);
+                        Ok(BoaValue::String(JsString::from(text)))
+                    })
+                }
+            };
+            let inner_getter_obj = FunctionObjectBuilder::new(ctx.realm(), inner_getter)
+                .name("get innerText").length(0).build();
+            let inner_setter = {
+                let doc = doc.clone();
+                let nid = node_id;
+                unsafe {
+                    NativeFunction::from_closure(move |_, args, _| {
+                        let value = args.first()
+                            .and_then(|v| v.as_string())
+                            .map(|s| s.to_std_string_escaped())
+                            .unwrap_or_default();
+                        let mut d = doc.lock().unwrap();
+                        set_text_content(&mut d, nid, &value);
+                        Ok(BoaValue::Undefined)
+                    })
+                }
+            };
+            let inner_setter_obj = FunctionObjectBuilder::new(ctx.realm(), inner_setter)
+                .name("set innerText").length(1).build();
+            obj.define_property_or_throw(
+                JsString::from("innerText"),
+                PropertyDescriptor::builder()
+                    .get(inner_getter_obj)
+                    .set(inner_setter_obj)
                     .enumerable(true)
                     .configurable(true)
                     .build(),
@@ -1295,10 +1531,32 @@ fn create_element_object(
             };
             let val_getter_obj = FunctionObjectBuilder::new(ctx.realm(), val_getter)
                 .name("get nodeValue").length(0).build();
+            let val_setter = {
+                let doc = doc.clone();
+                let nid = node_id;
+                unsafe {
+                    NativeFunction::from_closure(move |_, args, _ctx| {
+                        let value = args.first()
+                            .and_then(|v| v.as_string())
+                            .map(|s| s.to_std_string_escaped())
+                            .unwrap_or_default();
+                        let mut d = doc.lock().unwrap();
+                        if let Some(n) = d.node_mut(nid) {
+                            if let NodeKind::Text(t) = &mut n.kind {
+                                *t = value;
+                            }
+                        }
+                        Ok(BoaValue::Undefined)
+                    })
+                }
+            };
+            let val_setter_obj = FunctionObjectBuilder::new(ctx.realm(), val_setter)
+                .name("set nodeValue").length(1).build();
             obj.define_property_or_throw(
                 JsString::from("nodeValue"),
                 PropertyDescriptor::builder()
                     .get(val_getter_obj)
+                    .set(val_setter_obj)
                     .enumerable(true)
                     .configurable(true)
                     .build(),
@@ -1402,18 +1660,141 @@ fn create_element_object(
     style_obj.set(JsString::from("setProperty"), set_prop_fn, false, ctx).ok();
     obj.set(JsString::from("style"), style_obj, false, ctx).ok();
 
-    // appendChild (stub)
+    // appendChild: attach a node, moving it if it already has a parent
     let append_child = {
+        let doc = doc.clone();
+        let nid = node_id;
         unsafe {
             NativeFunction::from_closure(move |_, args, ctx| {
                 let child = args.first().cloned().unwrap_or(BoaValue::Null);
-                Ok(child)
+                let child_id = match js_node_id(&child, ctx) {
+                    Some(id) => id,
+                    None => return Ok(BoaValue::Null),
+                };
+                let mut d = doc.lock().unwrap();
+                let ok = d.insert_child(nid, child_id, usize::MAX);
+                drop(d);
+                if ok {
+                    Ok(child)
+                } else {
+                    Ok(BoaValue::Null)
+                }
             })
         }
     };
     let append_child = FunctionObjectBuilder::new(ctx.realm(), append_child)
         .name("appendChild").length(1).build();
     obj.set(JsString::from("appendChild"), append_child, false, ctx).ok();
+
+    // removeChild
+    let remove_child = {
+        let doc = doc.clone();
+        let nid = node_id;
+        unsafe {
+            NativeFunction::from_closure(move |_, args, ctx| {
+                let child = args.first().cloned().unwrap_or(BoaValue::Null);
+                let child_id = match js_node_id(&child, ctx) {
+                    Some(id) => id,
+                    None => return Ok(BoaValue::Null),
+                };
+                let mut d = doc.lock().unwrap();
+                let removed = d.remove_child(nid, child_id);
+                drop(d);
+                if removed {
+                    Ok(child)
+                } else {
+                    Ok(BoaValue::Null)
+                }
+            })
+        }
+    };
+    let remove_child = FunctionObjectBuilder::new(ctx.realm(), remove_child)
+        .name("removeChild").length(1).build();
+    obj.set(JsString::from("removeChild"), remove_child, false, ctx).ok();
+
+    // insertBefore: insert newChild before refChild (append when refChild is null)
+    let insert_before = {
+        let doc = doc.clone();
+        let nid = node_id;
+        unsafe {
+            NativeFunction::from_closure(move |_, args, ctx| {
+                let new_child = args.first().cloned().unwrap_or(BoaValue::Null);
+                let ref_child = args.get(1).cloned().unwrap_or(BoaValue::Null);
+                let new_id = match js_node_id(&new_child, ctx) {
+                    Some(id) => id,
+                    None => return Ok(new_child),
+                };
+                let mut d = doc.lock().unwrap();
+                let index = if ref_child.is_null() || ref_child.is_undefined() {
+                    usize::MAX
+                } else {
+                    match js_node_id(&ref_child, ctx) {
+                        Some(ref_id) => d
+                            .node(nid)
+                            .and_then(|n| n.children.iter().position(|c| *c == ref_id))
+                            .unwrap_or(usize::MAX),
+                        None => usize::MAX,
+                    }
+                };
+                d.insert_child(nid, new_id, index);
+                drop(d);
+                Ok(new_child)
+            })
+        }
+    };
+    let insert_before = FunctionObjectBuilder::new(ctx.realm(), insert_before)
+        .name("insertBefore").length(2).build();
+    obj.set(JsString::from("insertBefore"), insert_before, false, ctx).ok();
+
+    // replaceChild
+    let replace_child = {
+        let doc = doc.clone();
+        let nid = node_id;
+        unsafe {
+            NativeFunction::from_closure(move |_, args, ctx| {
+                let new_child = args.first().cloned().unwrap_or(BoaValue::Null);
+                let old_child = args.get(1).cloned().unwrap_or(BoaValue::Null);
+                let new_id = match js_node_id(&new_child, ctx) {
+                    Some(id) => id,
+                    None => return Ok(new_child),
+                };
+                let old_id = match js_node_id(&old_child, ctx) {
+                    Some(id) => id,
+                    None => return Ok(BoaValue::Null),
+                };
+                let mut d = doc.lock().unwrap();
+                let index = d
+                    .node(nid)
+                    .and_then(|n| n.children.iter().position(|c| *c == old_id))
+                    .unwrap_or(usize::MAX);
+                d.remove_child(nid, old_id);
+                d.insert_child(nid, new_id, index);
+                drop(d);
+                Ok(new_child)
+            })
+        }
+    };
+    let replace_child = FunctionObjectBuilder::new(ctx.realm(), replace_child)
+        .name("replaceChild").length(2).build();
+    obj.set(JsString::from("replaceChild"), replace_child, false, ctx).ok();
+
+    // remove(): detach this node from its parent
+    let remove_self = {
+        let doc = doc.clone();
+        let nid = node_id;
+        unsafe {
+            NativeFunction::from_closure(move |_, _, _| {
+                let mut d = doc.lock().unwrap();
+                if let Some(parent_id) = d.node(nid).and_then(|n| n.parent) {
+                    d.remove_child(parent_id, nid);
+                }
+                Ok(BoaValue::Undefined)
+            })
+        }
+    };
+    let remove_self = FunctionObjectBuilder::new(ctx.realm(), remove_self)
+        .name("remove").length(0).build();
+    obj.set(JsString::from("remove"), remove_self, false, ctx).ok();
 
     let class_list_obj = JsObject::with_null_proto();
     let class_add = {
@@ -1866,6 +2247,34 @@ fn get_text_content(doc: &Document, node_id: NodeId) -> String {
     text
 }
 
+/// Replace every child of `node_id` with a single text node.
+fn set_text_content(doc: &mut Document, node_id: NodeId, text: &str) {
+    let children: Vec<NodeId> = doc
+        .node(node_id)
+        .map(|n| n.children.clone())
+        .unwrap_or_default();
+    for child in children {
+        doc.remove_child(node_id, child);
+    }
+    if !text.is_empty() {
+        doc.append(node_id, NodeKind::Text(text.to_string()));
+    }
+}
+
+/// Read the `__kore_node_id` marker back off a wrapped DOM node object.
+fn js_node_id(value: &BoaValue, ctx: &mut Context) -> Option<NodeId> {
+    let obj = value.as_object()?;
+    let id = obj
+        .get(JsString::from("__kore_node_id"), ctx)
+        .ok()?
+        .to_i32(ctx)
+        .ok()?;
+    if id < 0 {
+        return None;
+    }
+    Some(NodeId(id as usize))
+}
+
 // ============ Value Conversion ============
 
 fn boa_to_our_value(val: &BoaValue, context: &mut Context) -> JsValue {
@@ -2215,6 +2624,45 @@ xhr.readyState;
     }
 
     #[test]
+    fn local_storage_persists_across_runtimes() -> Result<(), JsError> {
+        let storage = Arc::new(Mutex::new(WebStorage::default()));
+        let cookies = Arc::new(Mutex::new(CookieJar::default()));
+        let rt1 = JsRuntime::with_shared_storage(make_doc(), storage.clone(), cookies.clone())?;
+        rt1.eval("localStorage.setItem('theme', 'dark')")?;
+        rt1.eval("localStorage.setItem('count', '3')")?;
+        let result = rt1.eval("localStorage.length")?;
+        assert_eq!(result, QJsValue::Int(2));
+
+        let rt2 = JsRuntime::with_shared_storage(make_doc(), storage.clone(), cookies.clone())?;
+        let result = rt2.eval("localStorage.getItem('theme')")?;
+        assert_eq!(result, QJsValue::String("dark".to_string()));
+        let result = rt2.eval("localStorage.length === 2 && localStorage.key(0) !== null")?;
+        assert_eq!(result, QJsValue::Bool(true));
+        Ok(())
+    }
+
+    #[test]
+    fn document_cookie_roundtrip() -> Result<(), JsError> {
+        let rt = JsRuntime::new(make_doc())?;
+        rt.eval("document.cookie = 'session=abc123; Path=/; Domain=.example.com'")?;
+        let result = rt.eval("document.cookie")?;
+        assert_eq!(result, QJsValue::String("session=abc123".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn document_cookie_updates_and_removes() -> Result<(), JsError> {
+        let rt = JsRuntime::new(make_doc())?;
+        rt.eval("document.cookie = 'a=1'; document.cookie = 'b=2'")?;
+        let result = rt.eval("document.cookie")?;
+        assert_eq!(result, QJsValue::String("a=1; b=2".to_string()));
+        rt.eval("document.cookie = 'a='")?;
+        let result = rt.eval("document.cookie")?;
+        assert_eq!(result, QJsValue::String("b=2".to_string()));
+        Ok(())
+    }
+
+    #[test]
     fn history_push_state_triggers_navigation() -> Result<(), JsError> {
         let rt = JsRuntime::new(make_doc())?;
         rt.eval("history.pushState(null, '', 'https://example.com/page')")?;
@@ -2350,6 +2798,160 @@ xhr.readyState;
             returned.tagName;
         "#)?;
         assert_eq!(result, QJsValue::String("SPAN".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn append_child_attaches_node() -> Result<(), JsError> {
+        let rt = JsRuntime::new(make_doc())?;
+        let result = rt.eval(r#"
+            var parent = document.createElement('div');
+            var child = document.createElement('span');
+            var ret = parent.appendChild(child);
+            parent.firstChild.tagName === 'SPAN' && child.parentNode.tagName === 'DIV' && ret === child;
+        "#)?;
+        assert_eq!(result, QJsValue::Bool(true));
+        Ok(())
+    }
+
+    #[test]
+    fn append_child_moves_existing_node() -> Result<(), JsError> {
+        let rt = JsRuntime::new(make_doc())?;
+        let result = rt.eval(r#"
+            var parent = document.createElement('div');
+            var other = document.createElement('div');
+            var child = document.createElement('span');
+            parent.appendChild(child);
+            other.appendChild(child);
+            other.firstChild.tagName === 'SPAN' && parent.firstChild === null;
+        "#)?;
+        assert_eq!(result, QJsValue::Bool(true));
+        Ok(())
+    }
+
+    #[test]
+    fn remove_child_detaches() -> Result<(), JsError> {
+        let rt = JsRuntime::new(make_doc())?;
+        let result = rt.eval(r#"
+            var parent = document.createElement('div');
+            var child = document.createElement('span');
+            parent.appendChild(child);
+            var ret = parent.removeChild(child);
+            parent.firstChild === null && child.parentNode === null && ret === child;
+        "#)?;
+        assert_eq!(result, QJsValue::Bool(true));
+        Ok(())
+    }
+
+    #[test]
+    fn remove_child_unknown_returns_null() -> Result<(), JsError> {
+        let rt = JsRuntime::new(make_doc())?;
+        let result = rt.eval(r#"
+            var parent = document.createElement('div');
+            var stranger = document.createElement('span');
+            parent.removeChild(stranger) === null;
+        "#)?;
+        assert_eq!(result, QJsValue::Bool(true));
+        Ok(())
+    }
+
+    #[test]
+    fn insert_before_reorders() -> Result<(), JsError> {
+        let rt = JsRuntime::new(make_doc())?;
+        let result = rt.eval(r#"
+            var p = document.createElement('div');
+            var a = document.createElement('em');
+            var b = document.createElement('i');
+            var c = document.createElement('b');
+            p.appendChild(a);
+            p.appendChild(b);
+            p.insertBefore(c, a);
+            p.firstChild.tagName === 'B' && p.lastChild.tagName === 'I';
+        "#)?;
+        assert_eq!(result, QJsValue::Bool(true));
+        Ok(())
+    }
+
+    #[test]
+    fn insert_before_null_appends() -> Result<(), JsError> {
+        let rt = JsRuntime::new(make_doc())?;
+        let result = rt.eval(r#"
+            var p = document.createElement('div');
+            var a = document.createElement('em');
+            var c = document.createElement('b');
+            p.appendChild(a);
+            p.insertBefore(c, null);
+            p.lastChild.tagName === 'B';
+        "#)?;
+        assert_eq!(result, QJsValue::Bool(true));
+        Ok(())
+    }
+
+    #[test]
+    fn replace_child_swaps() -> Result<(), JsError> {
+        let rt = JsRuntime::new(make_doc())?;
+        let result = rt.eval(r#"
+            var p = document.createElement('div');
+            var a = document.createElement('em');
+            var b = document.createElement('i');
+            p.appendChild(a);
+            p.replaceChild(b, a);
+            p.firstChild.tagName === 'I' && a.parentNode === null;
+        "#)?;
+        assert_eq!(result, QJsValue::Bool(true));
+        Ok(())
+    }
+
+    #[test]
+    fn remove_self_detaches() -> Result<(), JsError> {
+        let rt = JsRuntime::new(make_doc())?;
+        let result = rt.eval(r#"
+            var p = document.createElement('div');
+            var c = document.createElement('span');
+            p.appendChild(c);
+            c.remove();
+            p.firstChild === null && c.parentNode === null;
+        "#)?;
+        assert_eq!(result, QJsValue::Bool(true));
+        Ok(())
+    }
+
+    #[test]
+    fn inner_text_write_replaces_children() -> Result<(), JsError> {
+        let rt = JsRuntime::new(make_doc())?;
+        let result = rt.eval(r#"
+            var p = document.createElement('div');
+            var s = document.createElement('span');
+            p.appendChild(s);
+            p.innerText = 'hello';
+            p.textContent;
+        "#)?;
+        assert_eq!(result, QJsValue::String("hello".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn text_content_write_replaces_children() -> Result<(), JsError> {
+        let rt = JsRuntime::new(make_doc())?;
+        let result = rt.eval(r#"
+            var p = document.createElement('div');
+            p.appendChild(document.createElement('b'));
+            p.textContent = 'x';
+            p.firstChild.nodeType === 3 && p.lastChild.nodeType === 3;
+        "#)?;
+        assert_eq!(result, QJsValue::Bool(true));
+        Ok(())
+    }
+
+    #[test]
+    fn node_value_write_updates_text() -> Result<(), JsError> {
+        let rt = JsRuntime::new(make_doc())?;
+        let result = rt.eval(r#"
+            var t = document.createTextNode('before');
+            t.nodeValue = 'after';
+            t.nodeValue;
+        "#)?;
+        assert_eq!(result, QJsValue::String("after".to_string()));
         Ok(())
     }
 

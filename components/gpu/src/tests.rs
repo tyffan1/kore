@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod display_list_tests {
     use crate::display_list::{
-        ClipRect, Color, DisplayCommand, DisplayList, DrawImage, DrawRect, DrawText,
+        ClipRect, Color, DisplayCommand, DisplayList, DrawImage, DrawRect, DrawText, GpuImage,
     };
 
     #[test]
@@ -57,6 +57,11 @@ mod display_list_tests {
             width: 64.0,
             height: 64.0,
             atlas_id: 0,
+            image: GpuImage {
+                width: 1,
+                height: 1,
+                pixels: vec![255, 0, 0, 255],
+            },
         });
 
         let cmds = list.commands();

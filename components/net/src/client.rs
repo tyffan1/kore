@@ -1,4 +1,4 @@
-use crate::{NetworkPolicy, PolicyError};
+use crate::{cache::CacheLookup, NetworkPolicy, PolicyError};
 use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Empty, Full};
@@ -8,7 +8,7 @@ use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
-use serde::{Deserialize, Serialize};
+use kore_ipc::{FetchRequest, FetchResponse, Method};
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::str::FromStr;
@@ -17,54 +17,24 @@ use std::time::Duration;
 use thiserror::Error;
 use url::Url;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Method {
-    Get,
-    Head,
-    Post,
-}
+use crate::cache::HttpCache;
+use crate::tracking::{cookie_policy, CookieDecision};
 
-impl From<Method> for hyper::Method {
-    fn from(method: Method) -> Self {
-        match method {
-            Method::Get => hyper::Method::GET,
-            Method::Head => hyper::Method::HEAD,
-            Method::Post => hyper::Method::POST,
-        }
+fn hyper_method(method: &Method) -> hyper::Method {
+    match method {
+        Method::Get => hyper::Method::GET,
+        Method::Head => hyper::Method::HEAD,
+        Method::Post => hyper::Method::POST,
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FetchRequest {
-    pub url: Url,
-    pub method: Method,
-    pub body: Option<Bytes>,
-    pub headers: Vec<(String, String)>,
-}
-
-impl FetchRequest {
-    pub fn get(url: &str) -> Result<Self, HttpError> {
-        Ok(Self {
-            url: Url::parse(url)?,
-            method: Method::Get,
-            body: None,
-            headers: Vec::new(),
-        })
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FetchResponse {
-    pub status: u16,
-    pub final_url: Url,
-    pub headers: Vec<(String, String)>,
-    pub body: Bytes,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpClientConfig {
     pub policy: NetworkPolicy,
     pub connect_timeout: Duration,
+    /// Block `Cookie`/`Set-Cookie` on requests whose site differs from the
+    /// top-level document's (third-party cookie blocking, ETP default).
+    pub block_third_party_cookies: bool,
 }
 
 impl Default for HttpClientConfig {
@@ -75,6 +45,7 @@ impl Default for HttpClientConfig {
                 ..NetworkPolicy::default()
             },
             connect_timeout: Duration::from_secs(10),
+            block_third_party_cookies: true,
         }
     }
 }
@@ -110,7 +81,9 @@ pub struct CookieJar {
 
 impl CookieJar {
     pub fn store(&self, domain: &str, cookies: &[String]) {
-        let mut jar = self.inner.lock().unwrap();
+        let Ok(mut jar) = self.inner.lock() else {
+            return;
+        };
         for cookie in cookies {
             if let Some((name, value)) = cookie.split_once('=') {
                 let key = format!("{}:{}", domain, name.trim());
@@ -121,7 +94,9 @@ impl CookieJar {
     }
 
     pub fn get_header(&self, domain: &str) -> String {
-        let jar = self.inner.lock().unwrap();
+        let Ok(jar) = self.inner.lock() else {
+            return String::new();
+        };
         jar.iter()
             .filter(|(k, _)| k.starts_with(&format!("{}:", domain)))
             .map(|(k, v)| {
@@ -138,6 +113,8 @@ pub struct HttpClient {
     config: HttpClientConfig,
     inner: HttpsClient,
     pub cookie_jar: CookieJar,
+    /// Shared HTTP cache (Cache-Control / ETag revalidation).
+    pub cache: HttpCache,
 }
 
 impl HttpClient {
@@ -154,7 +131,12 @@ impl HttpClient {
             .wrap_connector(http);
 
         let inner = Client::builder(TokioExecutor::new()).build(https);
-        Self { config, inner, cookie_jar: CookieJar::default() }
+        Self {
+            config,
+            inner,
+            cookie_jar: CookieJar::default(),
+            cache: HttpCache::default(),
+        }
     }
 
     pub fn policy(&self) -> &NetworkPolicy {
@@ -165,10 +147,22 @@ impl HttpClient {
         self.config.policy.validate_url(&request.url)?;
 
         let mut url = request.url;
-        let method = hyper::Method::from(request.method);
+        let method = hyper_method(&request.method);
+        let cacheable = matches!(request.method, Method::Get);
         let mut remaining = 10u8;
 
         loop {
+            let key = url.as_str().to_string();
+            let cached_entry = if cacheable {
+                match self.cache.lookup(&key) {
+                    Some(CacheLookup::Fresh(entry)) => return Ok(entry.to_hit_response()),
+                    Some(CacheLookup::Stale(entry)) => Some(entry),
+                    None => None,
+                }
+            } else {
+                None
+            };
+
             let uri = Uri::from_str(url.as_str())?;
 
             let mut builder = Request::builder()
@@ -188,7 +182,23 @@ impl HttpClient {
                 builder = builder.header(name.as_str(), value.as_str());
             }
 
-            let cookie_header = self.cookie_jar.get_header(url.host_str().unwrap_or(""));
+            if let Some(entry) = &cached_entry {
+                for (name, value) in entry.conditional_headers() {
+                    builder = builder.header(name.as_str(), value.as_str());
+                }
+            }
+
+            let third_party_blocked = cookie_policy(
+                request.top_level.as_deref(),
+                url.host_str().unwrap_or(""),
+                self.config.block_third_party_cookies,
+            ) == CookieDecision::Block;
+            // ETP: third-party requests get no cookies at all.
+            let cookie_header = if third_party_blocked {
+                String::new()
+            } else {
+                self.cookie_jar.get_header(url.host_str().unwrap_or(""))
+            };
             if !cookie_header.is_empty() {
                 builder = builder.header(hyper::header::COOKIE, cookie_header.as_str());
             }
@@ -215,7 +225,14 @@ impl HttpClient {
                 .collect();
             if !set_cookies.is_empty() {
                 let domain = url.host_str().unwrap_or("");
-                self.cookie_jar.store(domain, &set_cookies);
+                let third_party_blocked = cookie_policy(
+                    request.top_level.as_deref(),
+                    domain,
+                    self.config.block_third_party_cookies,
+                ) == CookieDecision::Block;
+                if !third_party_blocked {
+                    self.cookie_jar.store(domain, &set_cookies);
+                }
             }
 
             if status.is_redirection() && remaining > 0 {
@@ -232,7 +249,20 @@ impl HttpClient {
                 }
             }
 
-            return self.collect_response(url, response).await;
+            // 304 Not Modified: revalidation succeeded, serve the cached
+            // body without downloading it again.
+            if status == hyper::StatusCode::NOT_MODIFIED {
+                if let Some(entry) = cached_entry {
+                    self.cache.refresh(&key);
+                    return Ok(entry.to_revalidated_response());
+                }
+            }
+
+            let fetched = self.collect_response(url, response).await?;
+            if cacheable && fetched.status >= 200 && fetched.status < 300 {
+                self.cache.store(&key, &fetched);
+            }
+            return Ok(fetched);
         }
     }
 
@@ -278,6 +308,50 @@ impl HttpClient {
 impl Default for HttpClient {
     fn default() -> Self {
         Self::new(HttpClientConfig::default())
+    }
+}
+
+/// A boxed, `Send` future returned by [`Fetcher::fetch`].
+pub type BoxedFetch<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<FetchResponse, String>> + Send + 'a>>;
+
+/// Abstraction over "where does the network stack run".
+///
+/// In-process callers use [`HttpClient`]; when the network stack is moved
+/// into a dedicated process, a remote implementation forwards requests
+/// over IPC. `FetchResponse`/`HttpClient` are serializable so the same
+/// types cross the process boundary unchanged.
+pub trait Fetcher: Send + Sync {
+    fn fetch(&self, request: FetchRequest) -> BoxedFetch<'_>;
+}
+
+impl Fetcher for HttpClient {
+    fn fetch(&self, request: FetchRequest) -> BoxedFetch<'_> {
+        Box::pin(async move {
+            HttpClient::fetch(self, request).await.map_err(|e| e.to_string())
+        })
+    }
+}
+
+#[cfg(test)]
+mod fetcher_tests {
+    use super::*;
+
+    #[test]
+    fn http_client_implements_fetcher() {
+        fn requires_fetcher(_f: &dyn Fetcher) {}
+        requires_fetcher(&HttpClient::default());
+    }
+
+    #[test]
+    fn fetch_request_serde_roundtrip() {
+        if let Ok(request) = FetchRequest::get("https://example.com/index.html") {
+            if let Ok(encoded) = bincode::serialize(&request) {
+                if let Ok(decoded) = bincode::deserialize::<FetchRequest>(&encoded) {
+                    assert_eq!(decoded, request);
+                }
+            }
+        }
     }
 }
 

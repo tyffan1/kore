@@ -7,6 +7,6 @@ pub use engine::{layout_document, LayoutConfig, LayoutError};
 pub use geometry::{BoxEdges, Rect};
 pub use style::{
     AlignItems, ComputedStyle, Display, FlexDirection, FlexWrap, FontStyle, FontWeight,
-    JustifyContent,
+    GridTrack, JustifyContent, Position,
 };
 pub use tree::{LayoutNode, LayoutNodeId, LayoutTree};

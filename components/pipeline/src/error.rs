@@ -5,6 +5,9 @@ pub enum PipelineError {
     #[error("HTTP fetch error: {0}")]
     Http(#[from] kore_net::HttpError),
 
+    #[error("fetch failed: {0}")]
+    Network(String),
+
     #[error("HTML parse error: {0:?}")]
     Html(#[from] kore_html::TokenizerError),
 

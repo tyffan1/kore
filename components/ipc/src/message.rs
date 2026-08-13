@@ -1,10 +1,11 @@
+use crate::wire::{DisplayList, FetchRequest, FetchResponse};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
 pub type MessageId = u64;
 pub type ProcessId = u32;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IpcMessage {
     pub message_id: MessageId,
     pub sender_process_id: ProcessId,
@@ -29,7 +30,7 @@ impl IpcMessage {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum IpcPayload {
     NavigateToUrl { tab_id: u64, url: Url },
     PageLoaded(PageLoaded),
@@ -38,6 +39,27 @@ pub enum IpcPayload {
     RenderFrame(RenderFrame),
     JSEvalRequest(JsEvalRequest),
     JSEvalResult(JsEvalResult),
+    /// A page-load fetch handled by the dedicated network process.
+    Fetch { request: FetchRequest },
+    /// Response from the network process; the error carries a
+    /// human-readable description when the fetch failed.
+    FetchResult { response: Result<FetchResponse, String> },
+    /// A compositing frame handled by the dedicated GPU process.
+    RenderGpuFrame {
+        frame_id: u64,
+        width: u32,
+        height: u32,
+        display_list: DisplayList,
+    },
+    /// Pixels produced by the GPU process (RGBA, row-major).
+    GpuFrameRendered {
+        frame_id: u64,
+        width: u32,
+        height: u32,
+        pixels: Vec<u8>,
+    },
+    /// The GPU process failed to render a frame.
+    GpuFrameFailed { frame_id: u64, error: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,6 +125,7 @@ pub struct JsEvalResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wire::{Color, DrawRect};
 
     fn url(input: &str) -> Result<Url, url::ParseError> {
         Url::parse(input)
@@ -189,5 +212,70 @@ mod tests {
             request_id: 11,
             result: Ok("Kore".to_string()),
         }))
+    }
+
+    #[test]
+    fn roundtrips_fetch_request() -> Result<(), Box<dyn std::error::Error>> {
+        assert_roundtrip(IpcPayload::Fetch {
+            request: FetchRequest::get("https://example.com/page")?,
+        })
+    }
+
+    #[test]
+    fn roundtrips_fetch_result_ok() -> Result<(), Box<dyn std::error::Error>> {
+        let response = FetchResponse {
+            status: 200,
+            final_url: url("https://example.com/page")?,
+            headers: vec![("content-type".to_string(), "text/html".to_string())],
+            body: bytes::Bytes::from_static(b"<html></html>"),
+        };
+        assert_roundtrip(IpcPayload::FetchResult {
+            response: Ok(response),
+        })
+    }
+
+    #[test]
+    fn roundtrips_fetch_result_err() -> Result<(), Box<dyn std::error::Error>> {
+        assert_roundtrip(IpcPayload::FetchResult {
+            response: Err("connection refused".to_string()),
+        })
+    }
+
+    #[test]
+    fn roundtrips_render_gpu_frame() -> Result<(), Box<dyn std::error::Error>> {
+        let mut display_list = DisplayList::new();
+        display_list.push_rect(DrawRect {
+            x: 0.0,
+            y: 0.0,
+            width: 100.0,
+            height: 100.0,
+            color: Color::from_rgba8(255, 0, 0, 255),
+            opacity: 1.0,
+            translate: (0.0, 0.0),
+        });
+        assert_roundtrip(IpcPayload::RenderGpuFrame {
+            frame_id: 7,
+            width: 1280,
+            height: 720,
+            display_list,
+        })
+    }
+
+    #[test]
+    fn roundtrips_gpu_frame_rendered() -> Result<(), Box<dyn std::error::Error>> {
+        assert_roundtrip(IpcPayload::GpuFrameRendered {
+            frame_id: 7,
+            width: 1280,
+            height: 720,
+            pixels: vec![0u8; 1280 * 720 * 4],
+        })
+    }
+
+    #[test]
+    fn roundtrips_gpu_frame_failed() -> Result<(), Box<dyn std::error::Error>> {
+        assert_roundtrip(IpcPayload::GpuFrameFailed {
+            frame_id: 7,
+            error: "no adapter".to_string(),
+        })
     }
 }

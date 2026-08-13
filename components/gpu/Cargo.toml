@@ -8,12 +8,19 @@ rust-version.workspace = true
 [lib]
 path = "src/lib.rs"
 
+[[bin]]
+name = "kore-gpuprocess"
+path = "src/bin/kore_gpuprocess.rs"
+
 [lints]
 workspace = true
 
 [dependencies]
 bytemuck = { version = "1.16", features = ["derive"] }
 kore-font = { path = "../font" }
+kore-ipc = { path = "../ipc" }
+pollster = "0.4"
 serde.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 wgpu = { version = "22", default-features = false, features = ["wgsl", "dx12", "metal", "vulkan-portability"] }

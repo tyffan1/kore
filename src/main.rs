@@ -4,9 +4,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use clipboard::ClipboardProvider;
-use kore_browser::BrowserApp;
+use kore_browser::{BrowserApp, GpuProcess, NetworkProcess};
 use kore_devtools::DevTools;
-use kore_gpu::{ClipRect, Color, DisplayCommand, DisplayList, DrawCircle, DrawRect, DrawText, Renderer, RendererConfig};
+use kore_gpu::{Blitter, ClipRect, Color, DisplayCommand, DisplayList, DrawCircle, DrawRect, DrawText, Renderer, RendererConfig};
+use kore_net::{BoxedFetch, FetchRequest, Fetcher};
 use kore_pipeline::{Pipeline, RenderOutput};
 use kore_ui::{ModernTheme, WindowControlsStyle};
 use kore_window::{AppEvent, EventLoop, InputEvent, Key, Modifiers, MouseButton, WindowBuilder, WindowHandle};
@@ -20,6 +21,18 @@ const UI_FONT: &str = "SF Pro Text";
 
 fn c(r: u8, g: u8, b: u8) -> Color {
     Color::from_rgba8(r, g, b, 255)
+}
+
+/// Routes page-load fetches through the dedicated network process.
+struct RemoteFetcher {
+    network: Arc<NetworkProcess>,
+}
+
+impl Fetcher for RemoteFetcher {
+    fn fetch(&self, request: FetchRequest) -> BoxedFetch<'_> {
+        let network = Arc::clone(&self.network);
+        Box::pin(async move { network.fetch(request).await.map_err(|e| e.to_string()) })
+    }
 }
 
 fn text_draw(x: f32, y: f32, text: String, font_size: f32, color: Color) -> DrawText {
@@ -66,6 +79,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = std::process::Command::new("cmd")
         .args(["/c", "chcp 65001"])
         .output();
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+
+    // ── Network process: the HTTP/HTTPS stack runs in a sandboxed child ──
+    let pipeline: Arc<Pipeline> = match runtime.block_on(NetworkProcess::spawn()) {
+        Ok(network) => {
+            eprintln!("Network process started (pid {})", network.process_id());
+            Arc::new(Pipeline::new(Arc::new(RemoteFetcher {
+                network: Arc::new(network),
+            })))
+        }
+        Err(e) => {
+            eprintln!("Network process unavailable ({e}); falling back to in-process networking");
+            Arc::new(Pipeline::default())
+        }
+    };
+
+    // ── GPU process: compositing runs in a dedicated child ──
+    let gpu_process: Option<Arc<GpuProcess>> = match runtime.block_on(GpuProcess::spawn()) {
+        Ok(gpu) => {
+            eprintln!("GPU process started (pid {})", gpu.process_id());
+            Some(Arc::new(gpu))
+        }
+        Err(e) => {
+            eprintln!("GPU process unavailable ({e}); falling back to in-process rendering");
+            None
+        }
+    };
+
     let session_path = std::env::temp_dir().join("kore_session.json");
     let _ = std::fs::remove_file(&session_path);
     let mut browser = BrowserApp::new(session_path);
@@ -87,7 +131,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (tx, rx) = mpsc::sync_channel::<RenderOutput>(4);
     let state = RefCell::new(AppState {
         browser,
-        pipeline: Arc::new(Pipeline::default()),
+        pipeline,
         display_list: DisplayList::new(),
         content_display_list: DisplayList::new(),
         page_links: Vec::new(),
@@ -122,11 +166,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let renderer = RefCell::new(None::<Renderer>);
+    let blitter = RefCell::new(None::<Blitter>);
 
     el.run(move |event, elwt| {
         match event {
             AppEvent::Redraw => {
-                if renderer.borrow().is_none() {
+                if blitter.borrow().is_none() && renderer.borrow().is_none() {
                     match WindowHandle::new(elwt, &instance, &config) {
                         Ok(handle) => {
                             let (w, surface) = handle.into_parts();
@@ -135,18 +180,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 height: config.height,
                                 ..RendererConfig::default()
                             };
-                            match pollster::block_on(Renderer::new(
-                                &instance,
-                                surface,
-                                rcfg,
-                            )) {
-                                Ok(r) => {
-                                    w.request_redraw();
-                                    state.borrow_mut().window = Some(w.clone());
-                                    *renderer.borrow_mut() = Some(r);
+                            if gpu_process.is_some() {
+                                match pollster::block_on(Blitter::new(
+                                    &instance,
+                                    surface,
+                                    rcfg,
+                                )) {
+                                    Ok(b) => {
+                                        w.request_redraw();
+                                        state.borrow_mut().window = Some(w.clone());
+                                        *blitter.borrow_mut() = Some(b);
+                                    }
+                                    Err(e) => {
+                                        eprintln!("Blitter init error: {e}");
+                                    }
                                 }
-                                Err(e) => {
-                                    eprintln!("Renderer init error: {e}");
+                            } else {
+                                match pollster::block_on(Renderer::new(
+                                    &instance,
+                                    surface,
+                                    rcfg,
+                                )) {
+                                    Ok(r) => {
+                                        w.request_redraw();
+                                        state.borrow_mut().window = Some(w.clone());
+                                        *renderer.borrow_mut() = Some(r);
+                                    }
+                                    Err(e) => {
+                                        eprintln!("Renderer init error: {e}");
+                                    }
                                 }
                             }
                         }
@@ -183,12 +245,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
-                if let Some(r) = renderer.borrow_mut().as_mut() {
+                // ── Present a frame ──
+                // With a GPU process available, the display list is
+                // rendered offscreen in the child and the returned pixels
+                // are blitted onto the window surface.
+                if let Some(gpu) = &gpu_process {
+                    if blitter.borrow().is_some() {
+                        let display_list = state.borrow().display_list.clone();
+                        let (width, height) = (
+                            state.borrow().window_width as u32,
+                            state.borrow().window_height as u32,
+                        );
+                        match runtime.block_on(gpu.render_frame(display_list, width, height)) {
+                            Ok(image) => {
+                                if let Some(b) = blitter.borrow_mut().as_mut() {
+                                    if let Err(e) =
+                                        b.update_image(&image.pixels, image.width, image.height)
+                                    {
+                                        eprintln!("Blit update error: {e}");
+                                    }
+                                    if let Err(e) = b.present() {
+                                        eprintln!("Blit present error: {e}");
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("GPU render error: {e}");
+                            }
+                        }
+                        if let Some(ref w) = state.borrow().window {
+                            w.request_redraw();
+                        }
+                    }
+                } else if let Some(r) = renderer.borrow_mut().as_mut() {
                     let display_list = &state.borrow().display_list;
                     match r.begin_frame() {
                         Ok(mut frame) => {
                             r.submit(&mut frame, display_list);
-                            if let Err(e) = r.end_frame(frame) {
+                            if let Err(e) = pollster::block_on(r.end_frame(frame)) {
                                 eprintln!("Render error: {e}");
                             }
                             if let Some(ref w) = state.borrow().window {
@@ -210,6 +304,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             AppEvent::Resized { width, height } => {
                 state.borrow_mut().window_width = width as f32;
                 state.borrow_mut().window_height = height as f32;
+                if let Some(b) = blitter.borrow_mut().as_mut() {
+                    b.resize(width, height);
+                }
                 if let Some(r) = renderer.borrow_mut().as_mut() {
                     r.resize(width, height);
                 }

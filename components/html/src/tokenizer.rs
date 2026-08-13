@@ -98,8 +98,27 @@ impl<'a> HtmlTokenizer<'a> {
 
     fn start_tag(&mut self) -> Result<Token, TokenizerError> {
         self.cursor += 1;
-        let end = self.remaining().find('>').unwrap_or(self.remaining().len());
-        let mut body = self.remaining()[..end].trim().to_string();
+        let rest = self.remaining();
+        let mut end = rest.len();
+        let mut in_quote: Option<char> = None;
+        for (i, ch) in rest.char_indices() {
+            match in_quote {
+                Some(q) => {
+                    if ch == q {
+                        in_quote = None;
+                    }
+                }
+                None => match ch {
+                    '"' | '\'' => in_quote = Some(ch),
+                    '>' => {
+                        end = i;
+                        break;
+                    }
+                    _ => {}
+                },
+            }
+        }
+        let mut body = rest[..end].trim().to_string();
         let self_closing = body.ends_with('/');
         if self_closing {
             body.pop();

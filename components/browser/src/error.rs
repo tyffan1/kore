@@ -11,6 +11,18 @@ pub enum BrowserError {
     #[error("renderer communication error: {0}")]
     RendererIpc(String),
 
+    #[error("failed to spawn network process: {0}")]
+    NetworkSpawn(String),
+
+    #[error("network process communication error: {0}")]
+    NetworkIpc(String),
+
+    #[error("failed to spawn GPU process: {0}")]
+    GpuSpawn(String),
+
+    #[error("GPU process communication error: {0}")]
+    GpuIpc(String),
+
     #[error("session error: {0}")]
     Session(String),
 

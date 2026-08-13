@@ -16,7 +16,7 @@ pub use ast::{
     TimingFunction, Transform, TransformValue, Transition,
 };
 pub use cascade::{cascade_for_element, CascadedProperty, ElementSnapshot};
-pub use color::CssColor;
+pub use color::{parse_color, CssColor};
 pub use parser::{
     parse_stylesheet, parse_time_ms, parse_timing_function, parse_transform, parse_transition,
     CssParser, ParserError,

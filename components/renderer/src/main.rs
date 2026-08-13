@@ -81,7 +81,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     match rs.renderer.begin_frame() {
                         Ok(mut frame) => {
                             rs.renderer.submit(&mut frame, &rs.display_list);
-                            if let Err(e) = rs.renderer.end_frame(frame) {
+                            if let Err(e) = pollster::block_on(rs.renderer.end_frame(frame)) {
                                 eprintln!("Render error: {e}");
                             }
                             rs._window.request_redraw();

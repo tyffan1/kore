@@ -1,12 +1,16 @@
 use kore_css::{parse_stylesheet, CssColor};
-use kore_gpu::{Color, DisplayList, DrawRect, DrawText};
-use kore_html::{parse_document, NodeKind};
+use kore_gpu::{ClipRect, Color, DisplayList, DrawImage, DrawRect, DrawText, GpuImage};
+use kore_html::{parse_document, NodeId, NodeKind};
 use kore_layout::{layout_document, Display, FontStyle, FontWeight, LayoutConfig, LayoutTree};
-use kore_net::{FetchRequest, HttpClient};
+use kore_net::{
+    BlockReason, FetchRequest, Fetcher, HttpClient, Method, TrackingDecision, TrackingProtection,
+};
+use std::collections::HashMap;
 use std::sync::Arc;
 use url::Url;
 
 use crate::error::PipelineError;
+use crate::image::{decode_data_url, decode_image_bytes};
 
 const DEFAULT_CSS: &str = r#"
 html { display: block !important; }
@@ -57,24 +61,79 @@ pub struct RenderOutput {
     pub js_navigation: Option<String>,
 }
 
+/// Outcome of running the pipeline on an already-fetched document.
+enum RenderResult {
+    Done(RenderOutput),
+    Navigated(Url),
+}
+
+/// A rendered nested document (an `<iframe>`): its own display list plus the
+/// position of the frame box in the parent layout.
+#[derive(Debug, Clone)]
+pub struct NestedFrame {
+    pub display_list: DisplayList,
+    pub links: Vec<(f32, f32, f32, f32, String)>,
+    pub x: f32,
+    pub y: f32,
+}
+
 /// The render pipeline: fetch HTML → parse → find CSS → fetch CSS → cascade → layout → display list.
+///
+/// All network access goes through a [`Fetcher`], which may run in-process
+/// (default [`HttpClient`]) or in the dedicated network process.
 pub struct Pipeline {
-    http_client: HttpClient,
+    fetcher: Arc<dyn Fetcher>,
+    storage: kore_js::SharedStorage,
+    cookies: kore_js::SharedCookieJar,
+    tracking: TrackingProtection,
 }
 
 impl Default for Pipeline {
     fn default() -> Self {
-        Self::new(HttpClient::default())
+        Self::with_http_client(HttpClient::default())
     }
 }
 
 impl Pipeline {
-    pub fn new(http_client: HttpClient) -> Self {
-        Self { http_client }
+    /// Use an arbitrary fetcher (e.g. a remote one backed by the network
+    /// process).
+    pub fn new(fetcher: Arc<dyn Fetcher>) -> Self {
+        Self {
+            fetcher,
+            storage: Arc::new(std::sync::Mutex::new(kore_js::WebStorage::default())),
+            cookies: Arc::new(std::sync::Mutex::new(kore_js::CookieJar::default())),
+            tracking: TrackingProtection::new(),
+        }
     }
 
-    pub fn http_client(&self) -> &HttpClient {
-        &self.http_client
+    /// Shared storage backing `localStorage` and `document.cookie`, so they
+    /// survive navigation. Hand these out to DevTools to inspect live data.
+    pub fn storage(&self) -> kore_js::SharedStorage {
+        self.storage.clone()
+    }
+
+    pub fn cookies(&self) -> kore_js::SharedCookieJar {
+        self.cookies.clone()
+    }
+
+    /// Shared tracking protection (ETP): check blocks, toggle, and read the
+    /// block log from anywhere (e.g. DevTools).
+    pub fn tracking(&self) -> TrackingProtection {
+        self.tracking.clone()
+    }
+
+    /// Turn Enhanced Tracking Protection on/off.
+    pub fn set_etp_enabled(&self, enabled: bool) {
+        self.tracking.set_enabled(enabled);
+    }
+
+    /// Use an in-process HTTP client.
+    pub fn with_http_client(http_client: HttpClient) -> Self {
+        Self::new(Arc::new(http_client))
+    }
+
+    pub fn fetcher(&self) -> &Arc<dyn Fetcher> {
+        &self.fetcher
     }
 
     /// Run the full pipeline: fetch, parse, style, layout, and build a display list.
@@ -82,90 +141,371 @@ impl Pipeline {
         let mut current_url = url.clone();
         for _hop in 0..5 {
             let html_str = self.fetch_html(&current_url).await?;
-            let document = Arc::new(std::sync::Mutex::new(parse_document(&html_str)?));
+            match self.render_document(&html_str, &current_url).await? {
+                RenderResult::Done(output) => return Ok(output),
+                RenderResult::Navigated(next) => {
+                    current_url = next;
+                }
+            }
+        }
+        Err(PipelineError::RedirectLimit)
+    }
 
-            let mut js_navigation: Option<String> = None;
+    /// Run the pipeline on an already-fetched HTML document: parse it, run
+    /// scripts, apply styles, lay out, and build the display list (including
+    /// nested `<iframe>` frames).
+    async fn render_document(
+        &self,
+        html: &str,
+        current_url: &Url,
+    ) -> Result<RenderResult, PipelineError> {
+        let document = Arc::new(std::sync::Mutex::new(parse_document(html)?));
 
-            if let Ok(js_runtime) = kore_js::JsRuntime::new(document.clone()) {
-                let entries = collect_script_entries({
-                    let d = document.lock().unwrap();
-                    d.clone()
-                });
+        let mut js_navigation: Option<String> = None;
 
-                for entry in &entries {
-                    match entry {
-                        ScriptEntry::Inline(content) => {
-                            let _ = js_runtime.eval(content);
-                            let _ = js_runtime.run_jobs();
-                        }
-                        ScriptEntry::External(url) => {
-                            if let Ok(body) = fetch_script_source(url) {
+        if let Ok(js_runtime) = kore_js::JsRuntime::with_shared_storage(
+            document.clone(),
+            self.storage.clone(),
+            self.cookies.clone(),
+        ) {
+            let entries = collect_script_entries({
+                let d = document.lock().unwrap();
+                d.clone()
+            });
+
+            for entry in &entries {
+                match entry {
+                    ScriptEntry::Inline(content) => {
+                        let _ = js_runtime.eval(content);
+                        let _ = js_runtime.run_jobs();
+                    }
+                    ScriptEntry::External(url) => {
+                        if let Ok(request) = FetchRequest::get(url.as_str()) {
+                            if let Ok(response) = self.fetcher.fetch(request).await {
+                                let body = String::from_utf8_lossy(&response.body).to_string();
                                 let _ = js_runtime.eval(&body);
                                 let _ = js_runtime.run_jobs();
                             }
                         }
                     }
                 }
-
-                let _ = js_runtime.dispatch_dom_content_loaded();
-                let _ = js_runtime.flush_timers();
-
-                js_navigation = js_runtime.pending_navigation.lock().ok()
-                    .and_then(|mut nav| nav.take());
-
-                if let Some(ref nav_url) = js_navigation {
-                    if let Ok(new_url) = url::Url::parse(nav_url) {
-                        current_url = new_url;
-                        continue;
-                    }
-                }
             }
 
-            let title = {
-                let d = document.lock().unwrap();
-                page_title(&d)
-            };
+            let _ = js_runtime.dispatch_dom_content_loaded();
+            let _ = js_runtime.flush_timers();
 
-            let mut stylesheets = vec![DEFAULT_CSS.to_string()];
-
-            let css_futures: Vec<_> = {
-                let d = document.lock().unwrap();
-                linked_stylesheets(&d, &current_url)
-            }
-                .into_iter()
-                .map(|css_url| {
-                    let url = css_url.clone();
-                    async move { self.fetch_css(&url).await }
-                })
-                .collect();
-            for result in futures::future::join_all(css_futures).await {
-                if let Ok(css) = result {
-                    stylesheets.push(css);
-                }
-            }
-
-            let combined_css = stylesheets.join("\n");
-            let stylesheet = parse_stylesheet(&combined_css)?;
-
-            let (width, height) = (1264.0, 628.0);
-            let (display_list, links) = {
-                let d = document.lock().unwrap();
-                let layout_tree = layout_document(
-                    &d,
-                    &stylesheet,
-                    LayoutConfig {
-                        viewport_width: width,
-                        viewport_height: height,
-                    },
-                )?;
-                let dl = build_display_list_recursive(&d, &layout_tree, &stylesheet, width);
-                let links = extract_links(&d, &layout_tree);
-                (dl, links)
-            };
-
-            return Ok(RenderOutput { display_list, title, links, js_navigation });
+            js_navigation = js_runtime
+                .pending_navigation
+                .lock()
+                .ok()
+                .and_then(|mut nav| nav.take());
         }
-        Err(PipelineError::RedirectLimit)
+
+        if let Some(ref nav_url) = js_navigation {
+            if let Ok(new_url) = url::Url::parse(nav_url) {
+                return Ok(RenderResult::Navigated(new_url));
+            }
+        }
+
+        let title = {
+            let d = document.lock().unwrap();
+            page_title(&d)
+        };
+
+        let mut stylesheets = vec![DEFAULT_CSS.to_string()];
+
+        let css_futures: Vec<_> = {
+            let d = document.lock().unwrap();
+            linked_stylesheets(&d, current_url)
+        }
+            .into_iter()
+            .map(|css_url| {
+                let url = css_url.clone();
+                async move { self.fetch_css(&url).await }
+            })
+            .collect();
+        for result in futures::future::join_all(css_futures).await {
+            if let Ok(css) = result {
+                stylesheets.push(css);
+            }
+        }
+
+        let combined_css = stylesheets.join("\n");
+        let stylesheet = parse_stylesheet(&combined_css)?;
+
+        let (width, height) = (1264.0, 628.0);
+        let (display_list, links) = {
+            let d = document.lock().unwrap();
+            let layout_tree = layout_document(
+                &d,
+                &stylesheet,
+                LayoutConfig {
+                    viewport_width: width,
+                    viewport_height: height,
+                },
+            )?;
+            let iframes = self.render_iframes(&d, &layout_tree, current_url, 0).await;
+            let images = self.fetch_images(&d, current_url).await;
+            let dl = build_display_list_with_iframes(&d, &layout_tree, &images, current_url, &iframes);
+            let mut links = extract_links(&d, &layout_tree);
+            for frame in iframes.values() {
+                for (lx, ly, lw, lh, href) in &frame.links {
+                    links.push((frame.x + 1.0 + lx, frame.y + 1.0 + ly, *lw, *lh, href.clone()));
+                }
+            }
+            (dl, links)
+        };
+
+        Ok(RenderResult::Done(RenderOutput {
+            display_list,
+            title,
+            links,
+            js_navigation,
+        }))
+    }
+
+    /// Fetch and decode every `<img>` in `document` into a map keyed by
+    /// resolved URL / raw `data:` URL.
+    async fn fetch_images(
+        &self,
+        document: &kore_html::Document,
+        base: &Url,
+    ) -> HashMap<String, GpuImage> {
+        let image_keys = image_sources(document, base);
+        let image_futures: Vec<_> = image_keys
+            .iter()
+            .filter_map(|(key, url)| {
+                let url = url.as_ref()?;
+                if self.tracking.check(url, base.host_str()) == TrackingDecision::Block(BlockReason::TrackerDomain) {
+                    return None;
+                }
+                let key = key.clone();
+                let url = url.clone();
+                Some(async move {
+                    let request = FetchRequest::get(url.as_str()).ok()?;
+                    let response = self.fetcher.fetch(request).await.ok()?;
+                    let image = decode_image_bytes(&response.body)?;
+                    Some((key, image))
+                })
+            })
+            .collect();
+        let mut images: HashMap<String, GpuImage> = HashMap::new();
+        for result in futures::future::join_all(image_futures).await {
+            if let Some((key, image)) = result {
+                images.insert(key, image);
+            }
+        }
+        for (key, url) in &image_keys {
+            if url.is_none() {
+                if let Some(image) = decode_data_url(key) {
+                    images.insert(key.clone(), image);
+                }
+            }
+        }
+        images
+    }
+
+    /// Render the nested document of every `<iframe>` in the layout tree,
+    /// laid out at the iframe's own size. Recurses into nested frames up to
+    /// a depth limit.
+    async fn render_iframes(
+        &self,
+        document: &kore_html::Document,
+        layout_tree: &LayoutTree,
+        base: &Url,
+        depth: usize,
+    ) -> HashMap<NodeId, NestedFrame> {
+        if depth >= 3 {
+            return HashMap::new();
+        }
+
+        struct Spec {
+            dom_id: NodeId,
+            key: String,
+            content: Option<String>,
+            fetch: Option<Url>,
+            nested_base: Url,
+            x: f32,
+            y: f32,
+            w: f32,
+            h: f32,
+        }
+
+        let mut specs: Vec<Spec> = Vec::new();
+        for node in &layout_tree.nodes {
+            let Some(dom_id) = node.dom_node_id else { continue };
+            let Some(dom_node) = document.node(dom_id) else { continue };
+            let NodeKind::Element(el) = &dom_node.kind else { continue };
+            if !el.tag_name.eq_ignore_ascii_case("iframe") {
+                continue;
+            }
+            if node.rect.width <= 0.0 || node.rect.height <= 0.0 {
+                continue;
+            }
+            let srcdoc = get_attribute(el, "srcdoc");
+            let src = get_attribute(el, "src");
+            let (key, content, fetch, nested_base) = match (srcdoc, src) {
+                (Some(doc), _) => (format!("srcdoc:{doc}"), Some(doc), None, base.clone()),
+                (None, Some(src)) if !src.starts_with("data:") => match base.join(&src) {
+                    Ok(u) => {
+                        if self.tracking.check(&u, base.host_str()) == TrackingDecision::Block(BlockReason::TrackerDomain) {
+                            continue;
+                        }
+                        (u.as_str().to_string(), None, Some(u.clone()), u)
+                    }
+                    Err(_) => continue,
+                },
+                _ => continue,
+            };
+            specs.push(Spec {
+                dom_id,
+                key,
+                content,
+                fetch,
+                nested_base,
+                x: node.rect.x,
+                y: node.rect.y,
+                w: node.rect.width,
+                h: node.rect.height,
+            });
+        }
+
+        let mut bodies: HashMap<String, String> = HashMap::new();
+        let unique_fetches: Vec<(String, Url)> = specs
+            .iter()
+            .filter_map(|s| s.fetch.clone().map(|u| (s.key.clone(), u)))
+            .collect::<HashMap<_, _>>()
+            .into_iter()
+            .collect();
+        let results = futures::future::join_all(unique_fetches.iter().map(|(key, url)| {
+            let key = key.clone();
+            let url = url.clone();
+            async move {
+                let request = FetchRequest::get(url.as_str()).ok()?;
+                let response = self.fetcher.fetch(request).await.ok()?;
+                Some((key, String::from_utf8_lossy(&response.body).to_string()))
+            }
+        }))
+        .await;
+        for result in results {
+            if let Some((key, body)) = result {
+                bodies.insert(key, body);
+            }
+        }
+
+        let mut frames: HashMap<NodeId, NestedFrame> = HashMap::new();
+        let mut cache: HashMap<String, NestedFrame> = HashMap::new();
+        for spec in specs {
+            if frames.contains_key(&spec.dom_id) {
+                continue;
+            }
+            if let Some(frame) = cache.get(&spec.key) {
+                frames.insert(
+                    spec.dom_id,
+                    NestedFrame {
+                        display_list: frame.display_list.clone(),
+                        links: frame.links.clone(),
+                        x: spec.x,
+                        y: spec.y,
+                    },
+                );
+                continue;
+            }
+            let content = match spec.fetch {
+                Some(_) => match bodies.get(&spec.key) {
+                    Some(body) => body.clone(),
+                    None => continue,
+                },
+                None => spec.content.clone().unwrap_or_default(),
+            };
+            let Ok(nested_doc) = parse_document(&content) else { continue };
+            let nested_doc = Arc::new(std::sync::Mutex::new(nested_doc));
+            let Ok(stylesheet) = parse_stylesheet(DEFAULT_CSS) else { continue };
+            let Ok(nested_tree) = layout_document(
+                &nested_doc.lock().unwrap(),
+                &stylesheet,
+                LayoutConfig {
+                    viewport_width: spec.w,
+                    viewport_height: spec.h,
+                },
+            ) else {
+                continue;
+            };
+            let nested_images = self
+                .fetch_images(&nested_doc.lock().unwrap(), &spec.nested_base)
+                .await;
+            let nested_iframes = Box::pin(self.render_iframes(
+                &nested_doc.lock().unwrap(),
+                &nested_tree,
+                &spec.nested_base,
+                depth + 1,
+            ))
+            .await;
+            let dl = build_display_list_with_iframes(
+                &nested_doc.lock().unwrap(),
+                &nested_tree,
+                &nested_images,
+                &spec.nested_base,
+                &nested_iframes,
+            );
+            let links = extract_links(&nested_doc.lock().unwrap(), &nested_tree);
+            let frame = NestedFrame {
+                display_list: dl,
+                links,
+                x: spec.x,
+                y: spec.y,
+            };
+            cache.insert(spec.key, frame.clone());
+            frames.insert(spec.dom_id, frame);
+        }
+        frames
+    }
+
+    /// Submit an HTML form: collect its controls, then either navigate to
+    /// `action?<urlencoded>` (GET) or POST the urlencoded body to `action`.
+    pub async fn submit_form(
+        &self,
+        document: &kore_html::Document,
+        form_id: NodeId,
+        base: &Url,
+    ) -> Result<RenderOutput, PipelineError> {
+        let fields = collect_form_data(document, form_id);
+        let action = form_action(document, form_id).unwrap_or_else(|| base.to_string());
+        let method = form_method(document, form_id);
+        let mut action_url = base.join(&action)?;
+        let encoded = urlencode(&fields);
+
+        if method.eq_ignore_ascii_case("post") {
+            let request = FetchRequest {
+                url: action_url,
+                method: Method::Post,
+                body: Some(bytes::Bytes::from(encoded.into_bytes())),
+                headers: vec![(
+                    "content-type".to_string(),
+                    "application/x-www-form-urlencoded".to_string(),
+                )],
+                top_level: None,
+            };
+            let response = self
+                .fetcher
+                .fetch(request)
+                .await
+                .map_err(PipelineError::Network)?;
+            let html = String::from_utf8(response.body.to_vec())
+                .map_err(|_| PipelineError::InvalidUtf8)?;
+            match self.render_document(&html, &response.final_url).await? {
+                RenderResult::Done(output) => Ok(output),
+                RenderResult::Navigated(next) => self.render(&next).await,
+            }
+        } else {
+            let existing = action_url.query();
+            let query = match existing {
+                Some(q) if !q.is_empty() => format!("{q}&{encoded}"),
+                _ => encoded,
+            };
+            action_url.set_query(Some(&query));
+            self.render(&action_url).await
+        }
     }
 
     async fn fetch_html(&self, url: &Url) -> Result<String, PipelineError> {
@@ -173,13 +513,21 @@ impl Pipeline {
             return Ok(String::new());
         }
         let request = FetchRequest::get(url.as_str())?;
-        let response = self.http_client.fetch(request).await?;
+        let response = self
+            .fetcher
+            .fetch(request)
+            .await
+            .map_err(PipelineError::Network)?;
         String::from_utf8(response.body.to_vec()).map_err(|_| PipelineError::InvalidUtf8)
     }
 
     async fn fetch_css(&self, url: &Url) -> Result<String, PipelineError> {
         let request = FetchRequest::get(url.as_str())?;
-        let response = self.http_client.fetch(request).await?;
+        let response = self
+            .fetcher
+            .fetch(request)
+            .await
+            .map_err(PipelineError::Network)?;
         String::from_utf8(response.body.to_vec()).map_err(|_| PipelineError::InvalidUtf8)
     }
 }
@@ -312,20 +660,55 @@ fn get_script_text(document: &kore_html::Document, node_id: kore_html::NodeId) -
     text
 }
 
-fn fetch_script_source(url: &str) -> Result<String, String> {
-    reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .user_agent("Mozilla/5.0 (compatible; Kore/0.1.0)")
-        .build()
-        .map_err(|e| e.to_string())?
-        .get(url)
-        .send()
-        .map_err(|e| e.to_string())?
-        .text()
-        .map_err(|e| e.to_string())
+/// Convert a CssColor (kore-css) to a Color (kore-gpu).
+fn parse_inline_style(attributes: &[kore_html::Attribute]) -> (Option<Color>, Option<f32>, bool) {
+    let style_str = attributes
+        .iter()
+        .find(|a| a.name.eq_ignore_ascii_case("style"))
+        .map(|a| a.value.as_str())
+        .unwrap_or("");
+
+    if style_str.is_empty() {
+        return (None, None, false);
+    }
+
+    let mut color = None;
+    let mut font_size = None;
+    let mut bold = false;
+
+    for decl in style_str.split(';') {
+        let parts: Vec<&str> = decl.splitn(2, ':').collect();
+        if parts.len() != 2 {
+            continue;
+        }
+        let prop = parts[0].trim().to_lowercase();
+        let val = parts[1].trim();
+
+        match prop.as_str() {
+            "color" => {
+                if let Some(css_color) = kore_css::parse_color(val) {
+                    color = Some(to_gpu_color(css_color));
+                }
+            }
+            "font-size" => {
+                if let Some(px) = val.strip_suffix("px") {
+                    font_size = px.trim().parse().ok();
+                } else if let Some(em) = val.strip_suffix("em") {
+                    if let Ok(v) = em.trim().parse::<f32>() {
+                        font_size = Some(v * 16.0);
+                    }
+                }
+            }
+            "font-weight" => {
+                bold = val == "bold" || val == "700" || val == "800" || val == "900";
+            }
+            _ => {}
+        }
+    }
+
+    (color, font_size, bold)
 }
 
-/// Convert a CssColor (kore-css) to a Color (kore-gpu).
 fn to_gpu_color(css: CssColor) -> Color {
     Color::from_rgba8(css.r, css.g, css.b, css.a)
 }
@@ -468,8 +851,238 @@ pub fn extract_links(
     links
 }
 
+fn get_attribute(el: &kore_html::Element, name: &str) -> Option<String> {
+    el.attributes
+        .iter()
+        .find(|attr| attr.name.eq_ignore_ascii_case(name))
+        .map(|attr| attr.value.clone())
+}
+
+/// The map key for an image: the resolved absolute URL, or the raw
+/// `data:` URL (decoded locally without a network fetch).
+fn image_key(src: &str, base: &Url) -> String {
+    if src.starts_with("data:") {
+        src.to_string()
+    } else {
+        match base.join(src) {
+            Ok(url) => url.as_str().to_string(),
+            Err(_) => src.to_string(),
+        }
+    }
+}
+
+/// Collect every `<img src>` in the document. `None` marks data URLs,
+/// which are decoded locally rather than fetched.
+fn image_sources(document: &kore_html::Document, base: &Url) -> Vec<(String, Option<Url>)> {
+    let mut sources = Vec::new();
+    for node in document.nodes() {
+        if let NodeKind::Element(el) = &node.kind {
+            if el.tag_name.eq_ignore_ascii_case("img") {
+                if let Some(src) = get_attribute(el, "src") {
+                    if src.starts_with("data:") {
+                        sources.push((src, None));
+                    } else if let Ok(url) = base.join(&src) {
+                        sources.push((url.as_str().to_string(), Some(url)));
+                    }
+                }
+            }
+        }
+    }
+    sources
+}
+
+/// The `action` attribute of a form, if any.
+pub fn form_action(document: &kore_html::Document, form_id: NodeId) -> Option<String> {
+    let node = document.node(form_id)?;
+    let NodeKind::Element(el) = &node.kind else {
+        return None;
+    };
+    if !el.tag_name.eq_ignore_ascii_case("form") {
+        return None;
+    }
+    get_attribute(el, "action")
+}
+
+/// The submission method of a form: `"get"` by default, `"post"` when the
+/// `method` attribute says so.
+pub fn form_method(document: &kore_html::Document, form_id: NodeId) -> String {
+    let node = document.node(form_id);
+    let method = node.and_then(|n| match &n.kind {
+        NodeKind::Element(el) => get_attribute(el, "method"),
+        _ => None,
+    });
+    match method.as_deref() {
+        Some(m) if m.eq_ignore_ascii_case("post") => "post".to_string(),
+        _ => "get".to_string(),
+    }
+}
+
+/// Collect the `name=value` pairs of every control in a `<form>`, using the
+/// controls' static attribute values:
+/// - `input` — `value` attribute (checked `checkbox`/`radio` use their
+///   value or `"on"`; unchecked ones are skipped)
+/// - `select` — the selected option's value or text
+/// - `textarea` — its text content
+/// - `button` — its `value` attribute
+pub fn collect_form_data(document: &kore_html::Document, form_id: NodeId) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    let mut stack = vec![form_id];
+    while let Some(id) = stack.pop() {
+        let Some(node) = document.node(id) else {
+            continue;
+        };
+        stack.extend(node.children.iter().rev().copied());
+        let NodeKind::Element(el) = &node.kind else {
+            continue;
+        };
+        let Some(name) = get_attribute(el, "name") else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        match el.tag_name.to_ascii_lowercase().as_str() {
+            "input" => {
+                let input_type = get_attribute(el, "type")
+                    .map(|t| t.to_ascii_lowercase())
+                    .unwrap_or_else(|| "text".to_string());
+                match input_type.as_str() {
+                    "checkbox" | "radio" => {
+                        if get_attribute(el, "checked").is_some() {
+                            pairs.push((
+                                name,
+                                get_attribute(el, "value").unwrap_or_else(|| "on".to_string()),
+                            ));
+                        }
+                    }
+                    _ => pairs.push((name, get_attribute(el, "value").unwrap_or_default())),
+                }
+            }
+            "select" => pairs.push((name, selected_option(document, id))),
+            "textarea" => {
+                let text: String = node
+                    .children
+                    .iter()
+                    .filter_map(|child_id| document.node(*child_id))
+                    .filter_map(|child| {
+                        if let NodeKind::Text(t) = &child.kind {
+                            Some(t.as_str())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                pairs.push((name, text.trim().to_string()));
+            }
+            "button" => {
+                if let Some(value) = get_attribute(el, "value") {
+                    pairs.push((name, value));
+                }
+            }
+            _ => {}
+        }
+    }
+    pairs
+}
+
+/// The selected `<option>` of a `<select>`: the one with the `selected`
+/// attribute, or the first option.
+fn selected_option(document: &kore_html::Document, select_id: NodeId) -> String {
+    let mut first: Option<String> = None;
+    let Some(select) = document.node(select_id) else {
+        return String::new();
+    };
+    for child_id in &select.children {
+        let Some(child) = document.node(*child_id) else {
+            continue;
+        };
+        let NodeKind::Element(el) = &child.kind else {
+            continue;
+        };
+        if !el.tag_name.eq_ignore_ascii_case("option") {
+            continue;
+        }
+        let text: String = child
+            .children
+            .iter()
+            .filter_map(|c| document.node(*c))
+            .filter_map(|c| {
+                if let NodeKind::Text(t) = &c.kind {
+                    Some(t.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let value = get_attribute(el, "value").unwrap_or_else(|| text.trim().to_string());
+        if first.is_none() {
+            first = Some(value.clone());
+        }
+        if get_attribute(el, "selected").is_some() {
+            return value;
+        }
+    }
+    first.unwrap_or_default()
+}
+
+/// Percent-encode a `name=value` pair list as an `application/x-www-form-urlencoded`
+/// body or query string (`+` for spaces, `%XX` for everything else).
+pub fn urlencode(pairs: &[(String, String)]) -> String {
+    let mut out = String::new();
+    for (i, (key, value)) in pairs.iter().enumerate() {
+        if i > 0 {
+            out.push('&');
+        }
+        out.push_str(&percent_encode(key));
+        out.push('=');
+        out.push_str(&percent_encode(value));
+    }
+    out
+}
+
+fn percent_encode(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 /// Build a DisplayList from a LayoutTree and its associated DOM.
 pub fn build_display_list(document: &kore_html::Document, layout_tree: &LayoutTree) -> DisplayList {
+    let base = match Url::parse("about:blank") {
+        Ok(base) => base,
+        Err(_) => return DisplayList::new(),
+    };
+    build_display_list_with_images(document, layout_tree, &HashMap::new(), &base)
+}
+
+/// Like [`build_display_list`], but resolves `<img>` elements against
+/// `images` (a map from resolved URL / data-URL string to decoded pixels).
+pub fn build_display_list_with_images(
+    document: &kore_html::Document,
+    layout_tree: &LayoutTree,
+    images: &HashMap<String, GpuImage>,
+    base_url: &Url,
+) -> DisplayList {
+    build_display_list_with_iframes(document, layout_tree, images, base_url, &HashMap::new())
+}
+
+/// Like [`build_display_list_with_images`], but embeds the pre-rendered
+/// `<iframe>` contents from `iframes` (keyed by DOM node id).
+pub fn build_display_list_with_iframes(
+    document: &kore_html::Document,
+    layout_tree: &LayoutTree,
+    images: &HashMap<String, GpuImage>,
+    base_url: &Url,
+    iframes: &HashMap<NodeId, NestedFrame>,
+) -> DisplayList {
     let mut dl = DisplayList::new();
     let mut inline_cursor_x: Option<f32> = None;
     let mut inline_cursor_y: Option<f32> = None;
@@ -516,10 +1129,34 @@ pub fn build_display_list(document: &kore_html::Document, layout_tree: &LayoutTr
                                 .color
                                 .map(to_gpu_color)
                                 .unwrap_or(Color::BLACK);
-                            let font_size = node.style.font_size.unwrap_or(16.0);
-                            let bold = node.style.font_weight == FontWeight::Bold;
+                            let mut font_size = node.style.font_size.unwrap_or(16.0);
+                            let mut bold = node.style.font_weight == FontWeight::Bold;
                             let italic = node.style.font_style == FontStyle::Italic;
                             let is_inline = node.style.display == Display::Inline;
+
+                            // Check parent element for inline styles
+                            let (inline_color, inline_font_size, inline_bold) =
+                                if let Some(parent_id) = dom_node.parent {
+                                    if let Some(parent) = document.node(parent_id) {
+                                        if let NodeKind::Element(el) = &parent.kind {
+                                            parse_inline_style(&el.attributes)
+                                        } else {
+                                            (None, None, false)
+                                        }
+                                    } else {
+                                        (None, None, false)
+                                    }
+                                } else {
+                                    (None, None, false)
+                                };
+                            let final_color = inline_color.unwrap_or(text_color);
+                            if let Some(inline_fs) = inline_font_size {
+                                font_size = inline_fs;
+                            }
+                            if inline_bold {
+                                bold = true;
+                            }
+                            let baseline_offset = font_size * 0.8;
 
                             let render_x = if is_inline {
                                 if let (Some(cx), Some(cy)) = (inline_cursor_x, inline_cursor_y) {
@@ -538,10 +1175,10 @@ pub fn build_display_list(document: &kore_html::Document, layout_tree: &LayoutTr
 
                             dl.push_text(DrawText {
                                 x: render_x,
-                                y: content_rect.y,
+                                y: content_rect.y + baseline_offset,
                                 text: trimmed.to_string(),
                                 font_size,
-                                color: text_color,
+                                color: final_color,
                                 font_family: Some("sans-serif".to_string()),
                                 bold,
                                 italic,
@@ -557,15 +1194,120 @@ pub fn build_display_list(document: &kore_html::Document, layout_tree: &LayoutTr
                         }
                     }
                     NodeKind::Element(el) if el.tag_name.eq_ignore_ascii_case("img") => {
+                        let key = get_attribute(el, "src").map(|src| image_key(&src, base_url));
+                        let image = key.as_ref().and_then(|key| images.get(key));
+                        if let Some(image) = image {
+                            dl.push_image(DrawImage {
+                                x: node.rect.x,
+                                y: node.rect.y,
+                                width: node.rect.width,
+                                height: node.rect.height,
+                                atlas_id: 0,
+                                image: image.clone(),
+                            });
+                        } else {
+                            dl.push_rect(DrawRect {
+                                x: node.rect.x,
+                                y: node.rect.y,
+                                width: node.rect.width,
+                                height: node.rect.height,
+                                color: Color::from_rgba8(200, 200, 200, 255),
+                                opacity: 1.0,
+                                translate: (0.0, 0.0),
+                            });
+                        }
+                    }
+                    NodeKind::Element(el)
+                        if el.tag_name.eq_ignore_ascii_case("video")
+                            || el.tag_name.eq_ignore_ascii_case("audio") =>
+                    {
+                        let is_video = el.tag_name.eq_ignore_ascii_case("video");
+                        let bg = if is_video {
+                            Color::from_rgba8(16, 16, 16, 255)
+                        } else {
+                            Color::from_rgba8(226, 226, 226, 255)
+                        };
                         dl.push_rect(DrawRect {
                             x: node.rect.x,
                             y: node.rect.y,
                             width: node.rect.width,
                             height: node.rect.height,
-                            color: Color::from_rgba8(200, 200, 200, 255),
+                            color: bg,
                             opacity: 1.0,
                             translate: (0.0, 0.0),
                         });
+                        let label = if is_video {
+                            format!("▶ video ({}×{})", node.rect.width as i32, node.rect.height as i32)
+                        } else {
+                            format!("♪ audio ({}×{})", node.rect.width as i32, node.rect.height as i32)
+                        };
+                        let text_color = if is_video {
+                            Color::from_rgba8(235, 235, 235, 255)
+                        } else {
+                            Color::from_rgba8(70, 70, 70, 255)
+                        };
+                        dl.push_text(DrawText {
+                            x: node.rect.x + 8.0,
+                            y: node.rect.y + node.rect.height / 2.0 + 4.0,
+                            text: label,
+                            font_size: 14.0,
+                            color: text_color,
+                            font_family: Some("sans-serif".to_string()),
+                            bold: false,
+                            italic: false,
+                            opacity: 1.0,
+                            translate: (0.0, 0.0),
+                        });
+                    }
+                    NodeKind::Element(el) if el.tag_name.eq_ignore_ascii_case("iframe") => {
+                        match iframes.get(&dom_id) {
+                            Some(frame) => {
+                                dl.push_rect(DrawRect {
+                                    x: node.rect.x,
+                                    y: node.rect.y,
+                                    width: node.rect.width,
+                                    height: node.rect.height,
+                                    color: Color::from_rgba8(130, 130, 130, 255),
+                                    opacity: 1.0,
+                                    translate: (0.0, 0.0),
+                                });
+                                dl.push_clip(ClipRect {
+                                    x: node.rect.x + 1.0,
+                                    y: node.rect.y + 1.0,
+                                    width: node.rect.width - 2.0,
+                                    height: node.rect.height - 2.0,
+                                });
+                                dl.merge_translated(
+                                    &frame.display_list,
+                                    node.rect.x + 1.0,
+                                    node.rect.y + 1.0,
+                                );
+                                dl.pop_clip();
+                            }
+                            None => {
+                                dl.push_rect(DrawRect {
+                                    x: node.rect.x,
+                                    y: node.rect.y,
+                                    width: node.rect.width,
+                                    height: node.rect.height,
+                                    color: Color::from_rgba8(216, 216, 216, 255),
+                                    opacity: 1.0,
+                                    translate: (0.0, 0.0),
+                                });
+                                dl.push_text(DrawText {
+                                    x: node.rect.x + 8.0,
+                                    y: node.rect.y + node.rect.height / 2.0 + 4.0,
+                                    text: "iframe".to_string(),
+                                    font_size: 13.0,
+                                    color: Color::from_rgba8(90, 90, 90, 255),
+                                    font_family: Some("sans-serif".to_string()),
+                                    bold: false,
+                                    italic: false,
+                                    opacity: 1.0,
+                                    translate: (0.0, 0.0),
+                                });
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -595,6 +1337,89 @@ mod tests {
         .unwrap();
         let dl = build_display_list(&document, &layout_tree);
         (document, layout_tree, dl)
+    }
+
+    fn base64_encode(data: &[u8]) -> String {
+        const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in data.chunks(3) {
+            let b0 = chunk[0] as u32;
+            let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+            let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+            let triple = (b0 << 16) | (b1 << 8) | b2;
+            out.push(TABLE[(triple >> 18) as usize & 63] as char);
+            out.push(TABLE[(triple >> 12) as usize & 63] as char);
+            out.push(if chunk.len() > 1 { TABLE[(triple >> 6) as usize & 63] as char } else { '=' });
+            out.push(if chunk.len() > 2 { TABLE[triple as usize & 63] as char } else { '=' });
+        }
+        out
+    }
+
+    #[test]
+    fn data_url_img_emits_draw_image() {
+        let src = format!(
+            "data:image/png;base64,{}",
+            base64_encode(&crate::image::test_png_bytes())
+        );
+        let html = format!(r#"<img src="{}" width="64" height="64">"#, src);
+        let doc = parse_document(&html).unwrap();
+        let combined = format!("{}\nimg {{ display: block; }}", DEFAULT_CSS);
+        let stylesheet = parse_stylesheet(&combined).unwrap();
+        let layout_tree = layout_document(
+            &doc,
+            &stylesheet,
+            LayoutConfig {
+                viewport_width: 800.0,
+                viewport_height: 600.0,
+            },
+        )
+        .unwrap();
+        let mut images = HashMap::new();
+        images.insert(src.clone(), decode_data_url(&src).unwrap());
+        let base = Url::parse("https://example.com/page.html").unwrap();
+        let dl = build_display_list_with_images(&doc, &layout_tree, &images, &base);
+        let image_commands = dl
+            .commands()
+            .iter()
+            .filter_map(|cmd| match cmd {
+                kore_gpu::DisplayCommand::Image(img) => Some(img),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(image_commands.len(), 1);
+        assert_eq!(image_commands[0].image.width, 2);
+        assert_eq!(image_commands[0].image.height, 2);
+        assert_eq!(image_commands[0].width, 64.0);
+        assert_eq!(image_commands[0].height, 64.0);
+    }
+
+    #[test]
+    fn unresolved_img_falls_back_to_placeholder() {
+        let doc = parse_document(r#"<img src="missing.png" width="50" height="50">"#).unwrap();
+        let combined = format!("{}\nimg {{ display: block; }}", DEFAULT_CSS);
+        let stylesheet = parse_stylesheet(&combined).unwrap();
+        let layout_tree = layout_document(
+            &doc,
+            &stylesheet,
+            LayoutConfig {
+                viewport_width: 800.0,
+                viewport_height: 600.0,
+            },
+        )
+        .unwrap();
+        let dl = build_display_list_with_images(&doc, &layout_tree, &HashMap::new(), &Url::parse("https://example.com/").unwrap());
+        let has_image = dl.commands().iter().any(|cmd| {
+            matches!(cmd, kore_gpu::DisplayCommand::Image(_))
+        });
+        assert!(!has_image);
+        let placeholder = dl.commands().iter().any(|cmd| {
+            if let kore_gpu::DisplayCommand::Rect(rect) = cmd {
+                rect.width == 50.0 && rect.height == 50.0
+            } else {
+                false
+            }
+        });
+        assert!(placeholder);
     }
 
     fn find_rect(dl: &DisplayList, r: u8, g: u8, b: u8) -> Option<&DrawRect> {
@@ -959,5 +1784,446 @@ mod tests {
         let texts = find_text(&dl);
         let t = texts.iter().find(|t| t.text.contains("Text")).unwrap();
         assert!((t.font_size - 20.0).abs() < 0.01, "font size should be 20px");
+    }
+
+    #[test]
+    fn video_audio_emit_placeholder_rect_and_label() {
+        let (_, _, dl) = run_render(
+            r#"<video src="movie.mp4"></video><audio src="song.mp3"></audio>"#,
+            "",
+        );
+        let has_video_bg = dl.commands().iter().any(|cmd| {
+            if let kore_gpu::DisplayCommand::Rect(r) = cmd {
+                let c = Color::from_rgba8(16, 16, 16, 255);
+                (r.color.r - c.r).abs() < 0.01
+                    && (r.color.g - c.g).abs() < 0.01
+                    && (r.color.b - c.b).abs() < 0.01
+                    && (r.width - 300.0).abs() < 1.0
+                    && (r.height - 150.0).abs() < 1.0
+            } else {
+                false
+            }
+        });
+        let has_audio_bg = dl.commands().iter().any(|cmd| {
+            if let kore_gpu::DisplayCommand::Rect(r) = cmd {
+                let c = Color::from_rgba8(226, 226, 226, 255);
+                (r.color.r - c.r).abs() < 0.01
+                    && (r.color.g - c.g).abs() < 0.01
+                    && (r.color.b - c.b).abs() < 0.01
+                    && (r.width - 300.0).abs() < 1.0
+                    && (r.height - 54.0).abs() < 1.0
+            } else {
+                false
+            }
+        });
+        assert!(has_video_bg, "video should have a dark 300x150 placeholder rect");
+        assert!(has_audio_bg, "audio should have a light 300x54 placeholder rect");
+
+        let texts = find_text(&dl);
+        assert!(
+            texts.iter().any(|t| t.text.contains("▶")),
+            "video should draw a play label"
+        );
+        assert!(
+            texts.iter().any(|t| t.text.contains("♪")),
+            "audio should draw a music label"
+        );
+    }
+
+    #[test]
+    fn iframe_without_frame_shows_placeholder() {
+        let (doc, tree) = {
+            let document = parse_document(r#"<iframe width="320" height="200"></iframe>"#).unwrap();
+            let stylesheet = parse_stylesheet(DEFAULT_CSS).unwrap();
+            let layout_tree = layout_document(
+                &document,
+                &stylesheet,
+                LayoutConfig {
+                    viewport_width: 800.0,
+                    viewport_height: 600.0,
+                },
+            )
+            .unwrap();
+            (document, layout_tree)
+        };
+        let dl = build_display_list_with_iframes(
+            &doc,
+            &tree,
+            &HashMap::new(),
+            &Url::parse("https://example.com/").unwrap(),
+            &HashMap::new(),
+        );
+        let texts = find_text(&dl);
+        assert!(
+            texts.iter().any(|t| t.text.contains("iframe")),
+            "placeholder should label the iframe"
+        );
+    }
+
+    fn find_form_id(document: &kore_html::Document) -> Option<NodeId> {
+        document.nodes().iter().find(|n| {
+            if let NodeKind::Element(el) = &n.kind {
+                el.tag_name.eq_ignore_ascii_case("form")
+            } else {
+                false
+            }
+        })
+        .map(|n| n.id)
+    }
+
+    #[test]
+    fn collect_form_data_collects_controls() {
+        let doc = parse_document(
+            r#"<form>
+                <input name="q" value="rust">
+                <input name="hidden" type="hidden" value="x">
+                <input name="remember" type="checkbox" checked>
+                <input name="no" type="checkbox">
+                <input name="pick" type="radio" value="b" checked>
+                <select name="fruit">
+                    <option>apple</option>
+                    <option value="banana" selected>banana</option>
+                </select>
+                <textarea name="note">hello world</textarea>
+                <button name="save" value="yes">Save</button>
+                <input value="no-name">
+            </form>"#,
+        )
+        .unwrap();
+        let form = find_form_id(&doc).unwrap();
+        let pairs = collect_form_data(&doc, form);
+        let mut by_name: HashMap<&str, &str> = HashMap::new();
+        for (k, v) in &pairs {
+            by_name.insert(k.as_str(), v.as_str());
+        }
+        assert_eq!(by_name.get("q"), Some(&"rust"));
+        assert_eq!(by_name.get("hidden"), Some(&"x"));
+        assert_eq!(by_name.get("remember"), Some(&"on"));
+        assert!(!by_name.contains_key("no"));
+        assert_eq!(by_name.get("pick"), Some(&"b"));
+        assert_eq!(by_name.get("fruit"), Some(&"banana"));
+        assert_eq!(by_name.get("note"), Some(&"hello world"));
+        assert_eq!(by_name.get("save"), Some(&"yes"));
+        assert_eq!(pairs.len(), 7);
+    }
+
+    #[test]
+    fn form_action_and_method_defaults() {
+        let doc = parse_document(r#"<form></form>"#).unwrap();
+        let form = find_form_id(&doc).unwrap();
+        assert_eq!(form_action(&doc, form), None);
+        assert_eq!(form_method(&doc, form), "get");
+    }
+
+    #[test]
+    fn urlencode_percent_encodes() {
+        let out = urlencode(&[
+            ("q".to_string(), "hello world".to_string()),
+            ("k".to_string(), "caf\u{e9}".to_string()),
+            ("a+b".to_string(), "x&y".to_string()),
+        ]);
+        assert_eq!(out, "q=hello+world&k=caf%C3%A9&a%2Bb=x%26y");
+    }
+
+    #[derive(Clone)]
+    struct MockFetcher {
+        responses: Arc<HashMap<String, String>>,
+        requests: Arc<std::sync::Mutex<Vec<(String, Method, Option<String>)>>>,
+    }
+
+    impl MockFetcher {
+        fn new(responses: &[(&str, &str)]) -> Self {
+            let map = responses
+                .iter()
+                .map(|(u, b)| (u.to_string(), b.to_string()))
+                .collect();
+            Self {
+                responses: Arc::new(map),
+                requests: Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    impl kore_net::Fetcher for MockFetcher {
+        fn fetch(&self, request: FetchRequest) -> kore_net::BoxedFetch<'_> {
+            let url = request.url.as_str().to_string();
+            let method = request.method.clone();
+            let body = request
+                .body
+                .clone()
+                .map(|b| String::from_utf8_lossy(&b).to_string());
+            let responses = self.responses.clone();
+            let requests = self.requests.clone();
+            Box::pin(async move {
+                requests
+                    .lock()
+                    .unwrap()
+                    .push((url.clone(), method, body));
+                match responses.get(&url) {
+                    Some(html) => Ok(kore_net::FetchResponse {
+                        status: 200,
+                        final_url: request.url,
+                        headers: vec![],
+                        body: bytes::Bytes::from(html.clone().into_bytes()),
+                    }),
+                    None => Err(format!("no mock response for {url}")),
+                }
+            })
+        }
+    }
+
+    #[test]
+    fn iframe_srcdoc_renders_nested_content() {
+        let document = parse_document(
+            r#"<iframe srcdoc="<p>nested text</p>" width="320" height="200"></iframe>"#,
+        )
+        .unwrap();
+        let stylesheet = parse_stylesheet(DEFAULT_CSS).unwrap();
+        let tree = layout_document(
+            &document,
+            &stylesheet,
+            LayoutConfig {
+                viewport_width: 800.0,
+                viewport_height: 600.0,
+            },
+        )
+        .unwrap();
+        let base = Url::parse("https://example.com/").unwrap();
+        let pipeline = Pipeline::default();
+        let frames = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(pipeline.render_iframes(&document, &tree, &base, 0));
+
+        assert_eq!(frames.len(), 1, "srcdoc iframe should produce a nested frame");
+        let frame = frames.values().next().unwrap();
+        assert!(
+            find_text(&frame.display_list)
+                .iter()
+                .any(|t| t.text.contains("nested text")),
+            "nested frame should contain the srcdoc text"
+        );
+
+        let dl = build_display_list_with_iframes(
+            &document,
+            &tree,
+            &HashMap::new(),
+            &base,
+            &frames,
+        );
+        assert!(
+            dl.commands()
+                .iter()
+                .any(|c| matches!(c, kore_gpu::DisplayCommand::PushClip(_))),
+            "iframe content should be clipped"
+        );
+        let nested_text = find_text(&dl)
+            .into_iter()
+            .find(|t| t.text.contains("nested text"))
+            .expect("nested text should be merged into the parent list");
+        assert!(
+            nested_text.y > frame.y,
+            "nested text should be translated inside the frame box"
+        );
+    }
+
+    #[test]
+    fn iframe_src_fetches_and_renders() {
+        let mock = MockFetcher::new(&[(
+            "https://example.com/inner.html",
+            "<p>inner page</p>",
+        )]);
+        let pipeline = Pipeline::new(Arc::new(mock.clone()));
+        let document = parse_document(
+            r#"<iframe src="/inner.html" width="320" height="200"></iframe>"#,
+        )
+        .unwrap();
+        let stylesheet = parse_stylesheet(DEFAULT_CSS).unwrap();
+        let tree = layout_document(
+            &document,
+            &stylesheet,
+            LayoutConfig {
+                viewport_width: 800.0,
+                viewport_height: 600.0,
+            },
+        )
+        .unwrap();
+        let base = Url::parse("https://example.com/").unwrap();
+        let frames = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(pipeline.render_iframes(&document, &tree, &base, 0));
+        assert_eq!(frames.len(), 1, "src iframe should be fetched and rendered");
+        let frame = frames.values().next().unwrap();
+        assert!(
+            find_text(&frame.display_list)
+                .iter()
+                .any(|t| t.text.contains("inner page")),
+            "nested frame should contain the fetched page text"
+        );
+        let recorded = mock.requests.lock().unwrap();
+        assert!(
+            recorded
+                .iter()
+                .any(|(u, _, _)| u == "https://example.com/inner.html"),
+            "the iframe src should be fetched"
+        );
+    }
+
+    #[test]
+    fn submit_form_get_navigates_with_query() {
+        let mock = MockFetcher::new(&[(
+            "https://example.com/search?q=hello+world",
+            "<title>Results</title><p>found it</p>",
+        )]);
+        let pipeline = Pipeline::new(Arc::new(mock.clone()));
+        let document = parse_document(
+            r#"<form action="/search">
+                <input name="q" value="hello world">
+            </form>"#,
+        )
+        .unwrap();
+        let form = find_form_id(&document).unwrap();
+        let base = Url::parse("https://example.com/").unwrap();
+        let output = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(pipeline.submit_form(&document, form, &base))
+            .unwrap();
+        assert_eq!(output.title.as_deref(), Some("Results"));
+        assert!(
+            find_text(&output.display_list)
+                .iter()
+                .any(|t| t.text.contains("found it")),
+            "GET submit should render the destination page"
+        );
+    }
+
+    #[test]
+    fn submit_form_post_sends_urlencoded_body() {
+        let mock = MockFetcher::new(&[(
+            "https://example.com/login",
+            "<title>Logged In</title><p>welcome</p>",
+        )]);
+        let pipeline = Pipeline::new(Arc::new(mock.clone()));
+        let document = parse_document(
+            r#"<form action="/login" method="post">
+                <input name="user" value="alice">
+                <textarea name="note">hello world</textarea>
+            </form>"#,
+        )
+        .unwrap();
+        let form = find_form_id(&document).unwrap();
+        let base = Url::parse("https://example.com/").unwrap();
+        let output = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(pipeline.submit_form(&document, form, &base))
+            .unwrap();
+        assert_eq!(output.title.as_deref(), Some("Logged In"));
+
+        let recorded = mock.requests.lock().unwrap();
+        let post = recorded
+            .iter()
+            .find(|(_, m, _)| *m == Method::Post)
+            .expect("a POST request should be issued");
+        assert_eq!(post.0, "https://example.com/login");
+        assert_eq!(
+            post.2.as_deref(),
+            Some("user=alice&note=hello+world"),
+            "POST body should be urlencoded"
+        );
+    }
+
+    #[test]
+    fn tracker_image_is_skipped_and_logged() {
+        let mock = MockFetcher::new(&[(
+            "https://example.com/page",
+            r#"<img src="https://google-analytics.com/ga.gif">"#,
+        )]);
+        let pipeline = Pipeline::new(Arc::new(mock.clone()));
+        let url = Url::parse("https://example.com/page").unwrap();
+        let output = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(pipeline.render(&url))
+            .unwrap();
+        let recorded = mock.requests.lock().unwrap();
+        assert!(
+            recorded
+                .iter()
+                .all(|(u, _, _)| u == "https://example.com/page"),
+            "the tracker image must not be fetched: {recorded:?}"
+        );
+        assert_eq!(pipeline.tracking().blocked_count(), 1);
+        let blocked = pipeline.tracking().blocked();
+        assert_eq!(blocked[0].url, "https://google-analytics.com/ga.gif");
+        assert_eq!(
+            blocked[0].category,
+            Some(kore_net::TrackerCategory::Analytics)
+        );
+        let gray = Color::from_rgba8(200, 200, 200, 255);
+        let has_placeholder = output.display_list.commands().iter().any(|cmd| {
+            if let kore_gpu::DisplayCommand::Rect(r) = cmd {
+                (r.color.r - gray.r).abs() < 0.01
+                    && (r.color.g - gray.g).abs() < 0.01
+                    && (r.color.b - gray.b).abs() < 0.01
+            } else {
+                false
+            }
+        });
+        assert!(has_placeholder, "blocked image should fall back to a placeholder");
+    }
+
+    #[test]
+    fn tracker_iframe_is_not_rendered() {
+        let mock = MockFetcher::new(&[(
+            "https://example.com/page",
+            r#"<iframe src="https://doubleclick.net/pixel" width="200" height="100"></iframe>"#,
+        )]);
+        let pipeline = Pipeline::new(Arc::new(mock.clone()));
+        let url = Url::parse("https://example.com/page").unwrap();
+        let output = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(pipeline.render(&url))
+            .unwrap();
+        let recorded = mock.requests.lock().unwrap();
+        assert!(
+            recorded
+                .iter()
+                .all(|(u, _, _)| u == "https://example.com/page"),
+            "the tracker iframe must not be fetched: {recorded:?}"
+        );
+        assert_eq!(pipeline.tracking().blocked_count(), 1);
+        let texts = find_text(&output.display_list);
+        assert!(
+            texts.iter().any(|t| t.text.contains("iframe")),
+            "blocked iframe should show its placeholder box"
+        );
+    }
+
+    #[test]
+    fn etp_disabled_allows_tracker_requests() {
+        let mock = MockFetcher::new(&[(
+            "https://example.com/page",
+            r#"<img src="https://google-analytics.com/ga.gif">"#,
+        )]);
+        let pipeline = Pipeline::new(Arc::new(mock.clone()));
+        pipeline.set_etp_enabled(false);
+        let url = Url::parse("https://example.com/page").unwrap();
+        let _ = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(pipeline.render(&url))
+            .unwrap();
+        let recorded = mock.requests.lock().unwrap();
+        assert!(
+            recorded
+                .iter()
+                .any(|(u, _, _)| u == "https://google-analytics.com/ga.gif"),
+            "with ETP disabled the tracker should be fetched"
+        );
+        assert_eq!(pipeline.tracking().blocked_count(), 0);
     }
 }

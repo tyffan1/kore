@@ -1,7 +1,7 @@
-use serde::{Deserialize, Serialize};
+use kore_js::{Cookie, CookieJar, SharedCookieJar, SharedStorage, WebStorage};
 
-/// Stub for a cookie entry.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Display copy of a cookie entry.
+#[derive(Debug, Clone)]
 pub struct CookieStub {
     pub name: String,
     pub value: String,
@@ -9,63 +9,82 @@ pub struct CookieStub {
     pub path: String,
 }
 
-/// Stub for a localStorage entry.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Display copy of a localStorage entry.
+#[derive(Debug, Clone)]
 pub struct StorageEntry {
     pub key: String,
     pub value: String,
 }
 
-/// Storage inspector with stub data.
+/// Storage inspector: a live view over the browser's real `localStorage`
+/// and cookie jar (the same shared stores that back `localStorage` and
+/// `document.cookie` in the JS engine).
 #[derive(Debug, Clone)]
 pub struct StorageInspector {
-    pub cookies: Vec<CookieStub>,
-    pub local_storage: Vec<StorageEntry>,
+    storage: SharedStorage,
+    cookies: SharedCookieJar,
 }
 
 impl StorageInspector {
     pub fn new() -> Self {
-        Self {
-            cookies: Vec::new(),
-            local_storage: Vec::new(),
-        }
+        Self::from_shared(
+            std::sync::Arc::new(std::sync::Mutex::new(WebStorage::default())),
+            std::sync::Arc::new(std::sync::Mutex::new(CookieJar::default())),
+        )
     }
 
-    pub fn cookies(&self) -> &[CookieStub] {
-        &self.cookies
+    /// Attach to the shared stores owned by the render pipeline / session so
+    /// the inspector reflects real page data.
+    pub fn from_shared(storage: SharedStorage, cookies: SharedCookieJar) -> Self {
+        Self { storage, cookies }
     }
 
-    pub fn local_storage(&self) -> &[StorageEntry] {
-        &self.local_storage
+    pub fn cookies(&self) -> Vec<CookieStub> {
+        let jar = self.cookies.lock().unwrap();
+        jar.all()
+            .iter()
+            .map(|c| CookieStub {
+                name: c.name.clone(),
+                value: c.value.clone(),
+                domain: c.domain.clone(),
+                path: c.path.clone(),
+            })
+            .collect()
+    }
+
+    pub fn local_storage(&self) -> Vec<StorageEntry> {
+        let s = self.storage.lock().unwrap();
+        s.entries()
+            .into_iter()
+            .map(|(key, value)| StorageEntry { key, value })
+            .collect()
     }
 
     pub fn set_cookie(&mut self, cookie: CookieStub) {
-        if let Some(existing) = self.cookies.iter_mut().find(|c| c.name == cookie.name) {
-            *existing = cookie;
-        } else {
-            self.cookies.push(cookie);
-        }
+        let mut jar = self.cookies.lock().unwrap();
+        jar.set(Cookie {
+            name: cookie.name,
+            value: cookie.value,
+            domain: cookie.domain,
+            path: cookie.path,
+        });
     }
 
     pub fn remove_cookie(&mut self, name: &str) {
-        self.cookies.retain(|c| c.name != name);
+        self.cookies.lock().unwrap().remove(name, None, None);
     }
 
     pub fn set_local_storage(&mut self, entry: StorageEntry) {
-        if let Some(existing) = self.local_storage.iter_mut().find(|e| e.key == entry.key) {
-            *existing = entry;
-        } else {
-            self.local_storage.push(entry);
-        }
+        self.storage.lock().unwrap().set(entry.key, entry.value);
     }
 
     pub fn remove_local_storage(&mut self, key: &str) {
-        self.local_storage.retain(|e| e.key != key);
+        self.storage.lock().unwrap().remove(key);
     }
 
     pub fn clear_all(&mut self) {
-        self.cookies.clear();
-        self.local_storage.clear();
+        self.storage.lock().unwrap().clear();
+        self.cookies.lock().unwrap().clear();
     }
 }
 
@@ -162,5 +181,31 @@ mod tests {
         si.clear_all();
         assert!(si.cookies().is_empty());
         assert!(si.local_storage().is_empty());
+    }
+
+    #[test]
+    fn shared_view_reflects_external_writes() {
+        let storage = std::sync::Arc::new(std::sync::Mutex::new(WebStorage::default()));
+        let cookies = std::sync::Arc::new(std::sync::Mutex::new(CookieJar::default()));
+        let mut si = StorageInspector::from_shared(storage.clone(), cookies.clone());
+
+        storage.lock().unwrap().set("k".to_string(), "v".to_string());
+        cookies
+            .lock()
+            .unwrap()
+            .set(Cookie {
+                name: "sid".to_string(),
+                value: "1".to_string(),
+                domain: ".x.com".to_string(),
+                path: "/".to_string(),
+            });
+
+        assert_eq!(si.local_storage().len(), 1);
+        assert_eq!(si.local_storage()[0].key, "k");
+        assert_eq!(si.cookies().len(), 1);
+        assert_eq!(si.cookies()[0].name, "sid");
+
+        si.remove_local_storage("k");
+        assert!(storage.lock().unwrap().get("k").is_none());
     }
 }
