@@ -4,13 +4,31 @@ A Firefox-inspired browser built in Rust with a multi-process architecture.
 
 ## Current status
 
-**205/205 tests passing** — builds on Windows and macOS.
+**358/358 tests passing** — builds on Windows and macOS.
 
 `cargo run` opens a real window with a toolbar, tab bar, and address bar.
 The navigation pipeline fetches URLs via HTTPS, parses HTML and CSS,
 computes layout, and renders the result via wgpu. Real pages load and
 render (google.com tested). Cyrillic text displays correctly via HTML
 entity decoding.
+
+Recent additions:
+
+- **HTML form submission** — GET (query-append navigation) and POST
+  (urlencoded body), with control collection (`input`/`select`/`textarea`/`button`)
+- **Media & embedding** — `<video>`/`<audio>` placeholders with
+  proper default sizes, `<iframe>` rendering with nested layout,
+  clipping, and `srcdoc`/`src` support
+- **Enhanced Tracking Protection** — built-in tracker list
+  (ads/analytics/social/fingerprinting), Standard/Strict levels, and
+  third-party cookie blocking, with a shared block log
+- **DOM mutations** — `appendChild`/`removeChild`/`insertBefore`/
+  `replaceChild`/`remove()`, `textContent`/`innerText`/`nodeValue` setters
+- **Real storage** — `localStorage` and `document.cookie` backed by
+  shared storage that survives navigation, plus a live DevTools
+  Storage Inspector
+- **WebExtensions APIs** — real `webRequest`, `contextMenus`, and
+  `notifications` registries with listener dispatch and filters
 
 ## Architecture
 
@@ -19,8 +37,9 @@ Multi-process design inspired by Firefox:
 - **Main process** — window management, event loop, UI chrome, session persistence
 - **Renderer process** — sandboxed child process that receives `RenderFrame` IPC
   messages and paints via wgpu
-- **Network process** — (future) isolated HTTP/HTTPS stack
-- **GPU process** — (future) wgpu compositor in a dedicated process
+- **Network process** — isolated HTTP/HTTPS stack (`kore_network` bin):
+  rustls client, cookie jar, HTTP cache, ETP cookie policy
+- **GPU process** — wgpu compositor in a dedicated process (`kore_gpuprocess` bin)
 - **Extension process** — sandboxed child process per WebExtension
 
 Inter-process communication uses typed IPC over platform-native transports
@@ -32,21 +51,21 @@ serialization.
 | Crate | Description | Tests |
 |---|---|---|
 | kore-html | HTML5 tokenizer, tree builder, entity decoding | 4 |
-| kore-net | HTTP/HTTPS client with rustls, redirect following | 4 |
-| kore-css | CSS3 parser, specificity, cascade, color parsing | 16 |
-| kore-ipc | Typed IPC with serde+bincode, async Sender/Receiver | 8 |
-| kore-layout | Box model, flexbox, computed layout tree | 4 |
+| kore-net | HTTP/HTTPS client (rustls), cookie jar, HTTP cache, tracking protection | 32 |
+| kore-css | CSS3 parser, specificity, cascade, color parsing, transitions | 22 |
+| kore-ipc | Typed IPC with serde+bincode, async Sender/Receiver, wire types | 16 |
+| kore-layout | Box model, flexbox, computed layout tree, replaced-element sizing | 16 |
 | kore-gpu | wgpu display list, rect pipeline, font rendering via fontdue | 9 |
 | kore-sandbox | Process isolation, policy builder, cross-platform | 8 |
-| kore-browser | Tab manager, session save/restore, history, renderer process | 24 |
-| kore-ui | Toolbar, tabs, omnibox, theme system | 5 |
+| kore-browser | Tab manager, session save/restore, history, renderer/network/GPU bridges | 26 |
+| kore-ui | Toolbar, tabs, omnibox, theme system | 6 |
 | kore-window | winit integration, input events, window handle | 28 |
-| kore-pipeline | DOM→CSS→layout→display list render pipeline | 15 |
+| kore-pipeline | DOM→CSS→layout→display list pipeline, forms, iframes, scripts, ETP | 53 |
 | kore-font | fontdue rasterizer, glyph cache, text shaping | 20 |
-| kore-js | QuickJS engine, DOM bindings, script execution | 14 |
-| kore-extensions | WebExtensions API, manifest v2 parsing, sandboxed processes | 17 |
-| kore-devtools | Elements inspector, console capture, network log, storage stubs | 33 |
-| **Total** | | **205** |
+| kore-js | JS engine (Boa), DOM bindings, localStorage/cookies, script execution | 57 |
+| kore-extensions | WebExtensions API (webRequest/contextMenus/notifications), manifest v2 | 27 |
+| kore-devtools | Elements inspector, console capture, network log, storage inspector | 34 |
+| **Total** | | **358** |
 
 ## Prerequisites
 
@@ -67,7 +86,7 @@ cargo run
 **AppLocker / Smart App Control**
 
 If `cargo test` fails with `os error 4551`, Windows security policy is blocking
-unsigned test executables in the local `target/` directory. All 205 tests pass
+unsigned test executables in the local `target/` directory. All 358 tests pass
 on macOS; this is a Windows-environment-only issue.
 
 Solutions (pick one):
@@ -83,10 +102,10 @@ Solutions (pick one):
 
 ## Roadmap
 
+- Full tracker list (Disconnect-style) and per-site protection exceptions
+- Cookie partitioning (State Partitioning, CHIPS)
 - Improved CSS rendering (flexbox edge cases, positioned elements)
-- More complete JS DOM API (element manipulation, events)
-- Privacy features (tracking protection, Enhanced Tracking Protection)
-- Web compatibility (form submission, media elements, iframes)
+- JS execution inside iframes, `fetch()` in page scripts
 - Installer (Windows .msi, macOS .dmg, Linux AppImage)
 
 ## License
