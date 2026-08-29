@@ -55,6 +55,7 @@ pub struct JsRuntime {
     pub dom_state: Arc<Mutex<DomState>>,
     pub storage: SharedStorage,
     pub cookies: SharedCookieJar,
+    console_sink: Option<Arc<dyn Fn(String) + Send + Sync>>,
 }
 
 impl JsRuntime {
@@ -73,6 +74,15 @@ impl JsRuntime {
         storage: SharedStorage,
         cookies: SharedCookieJar,
     ) -> Result<Self, JsError> {
+        Self::with_shared_storage_and_console(document, storage, cookies, None)
+    }
+
+    pub fn with_shared_storage_and_console(
+        document: Arc<Mutex<Document>>,
+        storage: SharedStorage,
+        cookies: SharedCookieJar,
+        console_sink: Option<Arc<dyn Fn(String) + Send + Sync>>,
+    ) -> Result<Self, JsError> {
         let context = Context::default();
         let rt = Self {
             context: RefCell::new(context),
@@ -84,6 +94,7 @@ impl JsRuntime {
             })),
             storage,
             cookies,
+            console_sink,
         };
         rt.init_bindings()?;
         Ok(rt)
@@ -200,11 +211,19 @@ impl JsRuntime {
         let nav_sink = self.pending_navigation.clone();
         let dom_state = self.dom_state.clone();
 
-        let console_log = NativeFunction::from_fn_ptr(|_, args, context| {
-            let parts: Vec<String> = args.iter().map(|v| boa_debug_value(v, context)).collect();
-            eprintln!("[JS] {}", parts.join(" "));
-            Ok(BoaValue::Undefined)
-        });
+        let console_sink = self.console_sink.clone();
+        // Use unsafe closure so we can capture console_sink (from_fn_ptr can't capture).
+        let console_log = unsafe {
+            NativeFunction::from_closure(move |_, args, context| {
+                let parts: Vec<String> = args.iter().map(|v| boa_debug_value(v, context)).collect();
+                let text = parts.join(" ");
+                eprintln!("[JS] {}", text);
+                if let Some(sink) = console_sink.as_ref() {
+                    sink(text);
+                }
+                Ok(BoaValue::Undefined)
+            })
+        };
         ctx.register_global_callable(JsString::from("__console_log"), 1, console_log)
             .map_err(|e| JsError::Context(e.to_string()))?;
 

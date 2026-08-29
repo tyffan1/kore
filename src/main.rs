@@ -232,6 +232,8 @@ struct AppState {
     render_tx: mpsc::SyncSender<RenderOutput>,
     render_rx: mpsc::Receiver<RenderOutput>,
     devtools: DevTools,
+    devtools_console: std::sync::Arc<std::sync::Mutex<kore_devtools::ConsoleCapture>>,
+    devtools_network: std::sync::Arc<std::sync::Mutex<kore_devtools::NetworkLog>>,
     focused: bool,
     hovered_tab_index: Option<usize>,
     resize_edge: Option<ResizeEdge>,
@@ -291,6 +293,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
     let el = EventLoop::new()?;
 
+    // DevTools sinks: shared buffers that pipeline/js write into while
+    // the UI thread renders from DevTools. Wiring here ensures
+    // console.log(), network fetches and StorageInspector all show live
+    // data instead of staying empty.
+    let devtools_console = std::sync::Arc::new(std::sync::Mutex::new(kore_devtools::ConsoleCapture::new()));
+    let devtools_network = std::sync::Arc::new(std::sync::Mutex::new(kore_devtools::NetworkLog::new()));
+    pipeline.set_console_sink(devtools_console.clone());
+    pipeline.set_network_sink(devtools_network.clone());
+    let mut initial_devtools = DevTools::new();
+    initial_devtools.storage = kore_devtools::StorageInspector::from_shared(pipeline.storage(), pipeline.cookies());
+
     let (tx, rx) = mpsc::sync_channel::<RenderOutput>(4);
     let state = RefCell::new(AppState {
         browser,
@@ -323,7 +336,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         search_engine_index: 0,
         render_tx: tx,
         render_rx: rx,
-        devtools: DevTools::new(),
+        devtools: initial_devtools,
+        devtools_console,
+        devtools_network,
         focused: true,
         hovered_tab_index: None,
         resize_edge: None,
@@ -708,6 +723,25 @@ fn handle_mouse_click(state: &mut AppState, x: f64, y: f64) {
     if state.resizing.is_none() {
         if let Some(edge) = resize_edge_at(x, y, w, h) {
             state.resizing = Some(ResizeDrag { edge });
+            return;
+        }
+    }
+
+    // ── DevTools panel (bottom) ──
+    if state.devtools.is_visible() {
+        let panel_y = h - DEVTOOLS_H as f64;
+        if y >= panel_y {
+            if y < panel_y + DEVTOOLS_TAB_H as f64 {
+                let mut tx = 8.0;
+                for panel in kore_devtools::DevToolsPanel::all() {
+                    if x >= tx && x <= tx + 80.0 {
+                        state.devtools.switch_panel(*panel);
+                        return;
+                    }
+                    tx += 84.0;
+                }
+            }
+            // Click inside panel body — consume without navigating page.
             return;
         }
     }
@@ -1469,7 +1503,96 @@ fn draw_navbar(list: &mut DisplayList, w: f32, back_hov: bool, fwd_hov: bool, rl
     }
 }
 
+const DEVTOOLS_H: f32 = 240.0;
+const DEVTOOLS_TAB_H: f32 = 28.0;
+
+fn draw_devtools_panel(list: &mut DisplayList, devtools: &DevTools, x: f32, y: f32, w: f32, h: f32) {
+    // Panel background
+    list.push_rect(DrawRect { x, y, width: w, height: h, color: c(0x1E, 0x1E, 0x1E), opacity: 1.0, translate: (0.0, 0.0) });
+    // Top border
+    list.push_rect(DrawRect { x, y, width: w, height: 1.0, color: c(0x3C, 0x3C, 0x3C), opacity: 1.0, translate: (0.0, 0.0) });
+    // Tab bar
+    let mut tab_x = x + 8.0;
+    for panel in kore_devtools::DevToolsPanel::all() {
+        let is_active = *panel == devtools.active_panel();
+        let label = panel.name();
+        let tab_w = 80.0;
+        let tab_h = DEVTOOLS_TAB_H - 4.0;
+        let tab_y = y + 2.0;
+        let bg = if is_active { c(0x2D, 0x2D, 0x2D) } else { Color::TRANSPARENT };
+        if is_active {
+            list.push_rect(DrawRect { x: tab_x, y: tab_y, width: tab_w, height: tab_h, color: bg, opacity: 1.0, translate: (0.0, 0.0) });
+            // active underline
+            list.push_rect(DrawRect { x: tab_x, y: tab_y + tab_h - 2.0, width: tab_w, height: 2.0, color: c(ModernTheme::Accent.0, ModernTheme::Accent.1, ModernTheme::Accent.2), opacity: 1.0, translate: (0.0, 0.0) });
+        }
+        let tc = if is_active { c(0xFF, 0xFF, 0xFF) } else { c(0x99, 0x99, 0x99) };
+        list.push_text(text_draw(tab_x + 10.0, tab_y + 7.0, label.to_string(), 12.0, tc));
+        tab_x += tab_w + 4.0;
+    }
+    // Content area inside panel
+    let content_y = y + DEVTOOLS_TAB_H;
+    let content_h = h - DEVTOOLS_TAB_H;
+    list.push_clip(ClipRect { x: x + 8.0, y: content_y, width: w - 16.0, height: content_h - 8.0 });
+    let mut line_y = content_y + 8.0;
+    let line_step = 15.0;
+    let max_visible = ((content_h - 12.0) / line_step) as usize;
+    let render_lines: Vec<String> = match devtools.active_panel() {
+        kore_devtools::DevToolsPanel::Console => {
+            let msgs = devtools.console.messages();
+            if msgs.is_empty() { vec!["Console — no messages yet.".to_string()] } else {
+                msgs.iter().rev().take(max_visible).rev().map(|m| format!("[{}] {}", m.level.name(), m.text)).collect()
+            }
+        }
+        kore_devtools::DevToolsPanel::Network => {
+            let entries = devtools.network.entries();
+            if entries.is_empty() { vec!["Network — no requests yet.".to_string()] } else {
+                entries.iter().rev().take(max_visible).rev().map(|e| {
+                    let status = e.status.map(|s| s.to_string()).unwrap_or_else(|| "…".to_string());
+                    let dur = e.duration_ms.map(|d| format!(" {d}ms")).unwrap_or_default();
+                    format!("{} {} {}{}", e.method.name(), e.url, status, dur)
+                }).collect()
+            }
+        }
+        kore_devtools::DevToolsPanel::Storage => {
+            let mut lines = Vec::new();
+            let cookies = devtools.storage.cookies();
+            let storage = devtools.storage.local_storage();
+            if cookies.is_empty() && storage.is_empty() {
+                lines.push("Storage — empty.".to_string());
+            } else {
+                for c in cookies.iter().take(max_visible / 2) {
+                    lines.push(format!("cookie {}={} ({})", c.name, c.value, c.domain));
+                    if lines.len() >= max_visible { break; }
+                }
+                for s in storage.iter() {
+                    if lines.len() >= max_visible { break; }
+                    lines.push(format!("localStorage {}={}", s.key, s.value));
+                }
+            }
+            lines
+        }
+        kore_devtools::DevToolsPanel::Elements => {
+            vec!["Elements — DOM inspector (hover elements on page).".to_string(), "Use Ctrl+Shift+I to toggle DevTools.".to_string()]
+        }
+    };
+    for line in render_lines {
+        if line_y + 12.0 > content_y + content_h { break; }
+        // Truncate long lines
+        let truncated: String = if line.chars().count() > 120 { line.chars().take(117).collect::<String>() + "..." } else { line };
+        list.push_text(text_draw(x + 12.0, line_y, truncated, 11.0, c(0xCC, 0xCC, 0xCC)));
+        line_y += line_step;
+    }
+    list.pop_clip();
+}
+
 fn build_display_list(state: &mut AppState) {
+    // Sync shared sinks into the owned DevTools snapshot for rendering.
+    if let Ok(c) = state.devtools_console.lock() {
+        state.devtools.console = c.clone();
+    }
+    if let Ok(n) = state.devtools_network.lock() {
+        state.devtools.network = n.clone();
+    }
     let width = state.window_width;
     let height = state.window_height;
 
@@ -1513,9 +1636,10 @@ fn build_display_list(state: &mut AppState) {
     // Row 2 - Navigation + Address bar (y=36..80)
     draw_navbar(list, width, back_hov, fwd_hov, rld_hov, loading, url_text.clone(), is_secure, cursor_pos, selection_start, cursor_visible, address_bar_focused);
 
-    // Content area (y=80..height)
+    // Content area (y=80..height), shrink when DevTools visible.
+    let devtools_h = if state.devtools.is_visible() { DEVTOOLS_H } else { 0.0 };
     let content_area_y = HEADER_H;
-    let content_area_h = height - HEADER_H - 8.0; // 8px bottom guard
+    let content_area_h = (height - HEADER_H - devtools_h - 8.0).max(0.0);
 
     list.push_rect(DrawRect {
         x: 16.0, y: content_area_y, width: width - 32.0, height: content_area_h,
@@ -1571,6 +1695,12 @@ fn build_display_list(state: &mut AppState) {
         let thumb_y = content_area_y + scroll_frac * (content_area_h - thumb_height);
         list.push_rect(DrawRect { x: sb_x, y: content_area_y, width: scrollbar_width, height: content_area_h, color: Color::from_rgba8(ModernTheme::BorderSubtle.0, ModernTheme::BorderSubtle.1, ModernTheme::BorderSubtle.2, 100), opacity: 1.0, translate: (0.0, 0.0) });
         list.push_rect(DrawRect { x: sb_x, y: thumb_y, width: scrollbar_width, height: thumb_height, color: Color::from_rgba8(ModernTheme::TextSecondary.0, ModernTheme::TextSecondary.1, ModernTheme::TextSecondary.2, 150), opacity: 1.0, translate: (0.0, 0.0) });
+    }
+
+    // DevTools panel (bottom, like Chrome)
+    if state.devtools.is_visible() {
+        let panel_y = height - DEVTOOLS_H;
+        draw_devtools_panel(list, &state.devtools, 0.0, panel_y, width, DEVTOOLS_H);
     }
 
 }

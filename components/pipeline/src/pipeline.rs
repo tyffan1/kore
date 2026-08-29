@@ -87,6 +87,8 @@ pub struct Pipeline {
     storage: kore_js::SharedStorage,
     cookies: kore_js::SharedCookieJar,
     tracking: TrackingProtection,
+    console_sink: std::sync::Mutex<Option<std::sync::Arc<std::sync::Mutex<kore_devtools::ConsoleCapture>>>>,
+    network_sink: std::sync::Mutex<Option<std::sync::Arc<std::sync::Mutex<kore_devtools::NetworkLog>>>>,
 }
 
 impl Default for Pipeline {
@@ -104,6 +106,43 @@ impl Pipeline {
             storage: Arc::new(std::sync::Mutex::new(kore_js::WebStorage::default())),
             cookies: Arc::new(std::sync::Mutex::new(kore_js::CookieJar::default())),
             tracking: TrackingProtection::new(),
+            console_sink: std::sync::Mutex::new(None),
+            network_sink: std::sync::Mutex::new(None),
+        }
+    }
+
+    pub fn set_console_sink(&self, sink: std::sync::Arc<std::sync::Mutex<kore_devtools::ConsoleCapture>>) {
+        if let Ok(mut guard) = self.console_sink.lock() {
+            *guard = Some(sink);
+        }
+    }
+
+    pub fn set_network_sink(&self, sink: std::sync::Arc<std::sync::Mutex<kore_devtools::NetworkLog>>) {
+        if let Ok(mut guard) = self.network_sink.lock() {
+            *guard = Some(sink);
+        }
+    }
+
+    fn log_network_begin(&self, url: &Url, method: kore_devtools::RequestMethod) -> Option<u64> {
+        if let Ok(guard) = self.network_sink.lock() {
+            if let Some(sink) = guard.as_ref() {
+                if let Ok(mut log) = sink.lock() {
+                    return Some(log.begin_request(url.clone(), method));
+                }
+            }
+        }
+        None
+    }
+
+    fn log_network_complete(&self, id: Option<u64>, status: u16) {
+        if let Some(id) = id {
+            if let Ok(guard) = self.network_sink.lock() {
+                if let Some(sink) = guard.as_ref() {
+                    if let Ok(mut log) = sink.lock() {
+                        log.complete_request(id, status);
+                    }
+                }
+            }
         }
     }
 
@@ -178,10 +217,24 @@ impl Pipeline {
 
         let mut js_navigation: Option<String> = None;
 
-        if let Ok(js_runtime) = kore_js::JsRuntime::with_shared_storage(
+        let console_sink = self
+            .console_sink
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .map(|sink| {
+                let cb: std::sync::Arc<dyn Fn(String) + Send + Sync> = std::sync::Arc::new(move |text: String| {
+                    if let Ok(mut cap) = sink.lock() {
+                        cap.push(kore_devtools::ConsoleLevel::Log, text);
+                    }
+                });
+                cb
+            });
+        if let Ok(js_runtime) = kore_js::JsRuntime::with_shared_storage_and_console(
             document.clone(),
             self.storage.clone(),
             self.cookies.clone(),
+            console_sink,
         ) {
             let entries = collect_script_entries({
                 let d = document.lock().unwrap();
@@ -196,7 +249,7 @@ impl Pipeline {
                     }
                     ScriptEntry::External(url) => {
                         if let Ok(request) = FetchRequest::get(url.as_str()) {
-                            if let Ok(response) = self.fetcher.fetch(request).await {
+                            if let Ok(response) = self.fetch_with_logging(request).await {
                                 let body = String::from_utf8_lossy(&response.body).to_string();
                                 let _ = js_runtime.eval(&body);
                                 let _ = js_runtime.run_jobs();
@@ -298,7 +351,7 @@ impl Pipeline {
                 let url = url.clone();
                 Some(async move {
                     let request = FetchRequest::get(url.as_str()).ok()?;
-                    let response = self.fetcher.fetch(request).await.ok()?;
+                    let response = self.fetch_with_logging(request).await.ok()?;
                     let image = decode_image_bytes(&response.body)?;
                     Some((key, image))
                 })
@@ -397,7 +450,7 @@ impl Pipeline {
             let url = url.clone();
             async move {
                 let request = FetchRequest::get(url.as_str()).ok()?;
-                let response = self.fetcher.fetch(request).await.ok()?;
+                let response = self.fetch_with_logging(request).await.ok()?;
                 Some((key, String::from_utf8_lossy(&response.body).to_string()))
             }
         }))
@@ -501,11 +554,7 @@ impl Pipeline {
                 )],
                 top_level: None,
             };
-            let response = self
-                .fetcher
-                .fetch(request)
-                .await
-                .map_err(PipelineError::Network)?;
+            let response = self.fetch_with_logging(request).await?;
             let html = String::from_utf8(response.body.to_vec())
                 .map_err(|_| PipelineError::InvalidUtf8)?;
             match self.render_document(&html, &response.final_url).await? {
@@ -523,26 +572,34 @@ impl Pipeline {
         }
     }
 
+    async fn fetch_with_logging(&self, request: FetchRequest) -> Result<kore_ipc::FetchResponse, PipelineError> {
+        let dev_method = match request.method {
+            Method::Get => kore_devtools::RequestMethod::Get,
+            Method::Head => kore_devtools::RequestMethod::Head,
+            Method::Post => kore_devtools::RequestMethod::Post,
+            _ => kore_devtools::RequestMethod::Other(format!("{:?}", request.method)),
+        };
+        let id = self.log_network_begin(&request.url, dev_method);
+        let result = self.fetcher.fetch(request).await;
+        match &result {
+            Ok(resp) => self.log_network_complete(id, resp.status),
+            Err(_) => self.log_network_complete(id, 0),
+        }
+        result.map_err(PipelineError::Network)
+    }
+
     async fn fetch_html(&self, url: &Url) -> Result<String, PipelineError> {
         if is_about_blank(url) {
             return Ok(String::new());
         }
         let request = FetchRequest::get(url.as_str())?;
-        let response = self
-            .fetcher
-            .fetch(request)
-            .await
-            .map_err(PipelineError::Network)?;
+        let response = self.fetch_with_logging(request).await?;
         String::from_utf8(response.body.to_vec()).map_err(|_| PipelineError::InvalidUtf8)
     }
 
     async fn fetch_css(&self, url: &Url) -> Result<String, PipelineError> {
         let request = FetchRequest::get(url.as_str())?;
-        let response = self
-            .fetcher
-            .fetch(request)
-            .await
-            .map_err(PipelineError::Network)?;
+        let response = self.fetch_with_logging(request).await?;
         String::from_utf8(response.body.to_vec()).map_err(|_| PipelineError::InvalidUtf8)
     }
 }

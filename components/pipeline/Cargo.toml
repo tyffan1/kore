@@ -14,6 +14,8 @@ workspace = true
 [dependencies]
 bytes.workspace = true
 futures = "0.3"
+kore-devtools = { path = "../devtools" }
+kore-ipc = { path = "../ipc" }
 kore-css = { path = "../css" }
 kore-gpu = { path = "../gpu" }
 kore-html = { path = "../html" }
