@@ -76,6 +76,17 @@ impl WindowHandle {
         self.window.id().into()
     }
 
+    /// The DPI scale factor, for converting between logical and physical units.
+    pub fn scale_factor(&self) -> f64 {
+        self.window.scale_factor()
+    }
+
+    /// Change the mouse cursor icon (used for resize handles on a
+    /// frameless window).
+    pub fn set_cursor(&self, icon: winit::window::CursorIcon) {
+        self.window.set_cursor(icon);
+    }
+
     // ── Window operations ──────────────────────────────────────
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -156,6 +167,10 @@ mod tests {
             h.maximize();
             h.restore();
             h.close();
+        };
+        let _: fn(&WindowHandle) = |h| {
+            h.set_cursor(winit::window::CursorIcon::SeResize);
+            let _ = h.scale_factor();
         };
     }
 }

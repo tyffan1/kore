@@ -191,7 +191,7 @@ mod tests {
 
     #[test]
     fn cubic_bezier_linear_is_identity() {
-        let mut anim = AnimationState {
+        let anim = AnimationState {
             node_id: 0,
             property: "opacity".to_string(),
             from_value: AnimatableValue::Float(0.0),

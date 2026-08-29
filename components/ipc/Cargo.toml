@@ -15,6 +15,7 @@ workspace = true
 bincode.workspace = true
 bytes.workspace = true
 serde.workspace = true
+serde_bytes.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 url.workspace = true

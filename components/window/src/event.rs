@@ -58,6 +58,9 @@ pub enum InputEvent {
         x: f64,
         y: f64,
     },
+    MouseReleased {
+        button: MouseButton,
+    },
     Scroll {
         delta_x: f64,
         delta_y: f64,
@@ -111,6 +114,12 @@ mod tests {
     }
 
     #[test]
+    fn constructs_mouse_released() {
+        let ev = InputEvent::MouseReleased { button: MouseButton::Left };
+        assert!(matches!(ev, InputEvent::MouseReleased { button: MouseButton::Left }));
+    }
+
+    #[test]
     fn constructs_scroll() {
         let ev = InputEvent::Scroll {
             delta_x: 0.0,
@@ -135,9 +144,10 @@ mod tests {
             InputEvent::TextInput("hello".to_string()),
             InputEvent::MouseMoved { x: 0.0, y: 0.0 },
             InputEvent::MouseClicked { button: MouseButton::Right, x: 1.0, y: 2.0 },
+            InputEvent::MouseReleased { button: MouseButton::Left },
             InputEvent::Scroll { delta_x: 0.0, delta_y: -1.0 },
         ];
-        assert_eq!(events.len(), 6);
+        assert_eq!(events.len(), 7);
     }
 
     #[test]

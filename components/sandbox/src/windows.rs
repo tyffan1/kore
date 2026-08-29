@@ -1,4 +1,4 @@
-#![allow(non_snake_case, non_camel_case_types, dead_code)]
+#![allow(non_snake_case, non_camel_case_types, dead_code, clippy::upper_case_acronyms)]
 
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
@@ -50,6 +50,7 @@ extern "system" {
     fn TerminateProcess(hProcess: HANDLE, uExitCode: u32) -> BOOL;
     fn ResumeThread(hThread: HANDLE) -> DWORD;
     fn GetExitCodeProcess(hProcess: HANDLE, lpExitCode: *mut DWORD) -> BOOL;
+    fn GetLastError() -> DWORD;
 }
 
 // ── Win32 structs ───────────────────────────────────────────────
@@ -98,8 +99,8 @@ struct JOBOBJECT_BASIC_LIMIT_INFORMATION {
     MaximumWorkingSetSize: usize,
     ActiveProcessLimit: DWORD,
     Affinity: usize,
-    ChildProcessRestrictions: DWORD,
-    Reserved: [u64; 2],
+    PriorityClass: DWORD,
+    SchedulingClass: DWORD,
 }
 
 #[repr(C)]
@@ -286,8 +287,8 @@ unsafe fn set_job_limits(job_handle: HANDLE, policy: &Policy) -> Result<(), Sand
         MaximumWorkingSetSize: 0,
         ActiveProcessLimit: 0,
         Affinity: 0,
-        ChildProcessRestrictions: 0,
-        Reserved: [0; 2],
+        PriorityClass: 0,
+        SchedulingClass: 0,
     };
 
     if let Some(cpu_ms) = policy.max_cpu_time {
@@ -325,10 +326,32 @@ unsafe fn set_job_limits(job_handle: HANDLE, policy: &Policy) -> Result<(), Sand
     );
 
     if result == FALSE {
-        return Err(SandboxError::Spawn(
-            "failed to set job object limits".into(),
-        ));
+        let code = GetLastError();
+        return Err(SandboxError::Spawn(format!(
+            "failed to set job object limits (error {code})"
+        )));
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn job_object_structs_match_windows_sdk_layout() {
+        // Windows SDK sizes on x64 (56/128 on x86).
+        assert_eq!(std::mem::size_of::<JOBOBJECT_BASIC_LIMIT_INFORMATION>(), 64);
+        assert_eq!(std::mem::size_of::<IO_COUNTERS>(), 48);
+        assert_eq!(std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>(), 144);
+    }
+
+    #[test]
+    fn job_object_constants_match_windows_sdk() {
+        assert_eq!(JOB_OBJECT_EXTENDED_LIMIT_INFORMATION, 9);
+        assert_eq!(JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, 0x00002000);
+        assert_eq!(JOB_OBJECT_LIMIT_PROCESS_TIME, 0x00000002);
+        assert_eq!(JOB_OBJECT_LIMIT_JOB_MEMORY, 0x00000200);
+    }
 }

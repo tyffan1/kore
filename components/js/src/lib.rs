@@ -1581,7 +1581,7 @@ fn create_element_object(
         let ds = dom_state.clone();
         let nid = node_id;
         unsafe {
-            NativeFunction::from_closure(move |_, args, ctx| {
+            NativeFunction::from_closure(move |_, args, _ctx| {
                 let event_type = args.first()
                     .and_then(|v| v.as_string())
                     .map(|s| s.to_std_string_escaped())
@@ -1801,7 +1801,7 @@ fn create_element_object(
         let doc = doc.clone();
         let nid = node_id;
         unsafe {
-            NativeFunction::from_closure(move |_, args, ctx| {
+            NativeFunction::from_closure(move |_, args, _ctx| {
                 let cls = args.first()
                     .and_then(|v| v.as_string())
                     .map(|s| s.to_std_string_escaped())
@@ -1828,7 +1828,7 @@ fn create_element_object(
         let doc = doc.clone();
         let nid = node_id;
         unsafe {
-            NativeFunction::from_closure(move |_, args, ctx| {
+            NativeFunction::from_closure(move |_, args, _ctx| {
                 let cls = args.first()
                     .and_then(|v| v.as_string())
                     .map(|s| s.to_std_string_escaped())
@@ -1850,7 +1850,7 @@ fn create_element_object(
         let doc = doc.clone();
         let nid = node_id;
         unsafe {
-            NativeFunction::from_closure(move |_, args, ctx| {
+            NativeFunction::from_closure(move |_, args, _ctx| {
                 let cls = args.first()
                     .and_then(|v| v.as_string())
                     .map(|s| s.to_std_string_escaped())
@@ -1870,7 +1870,7 @@ fn create_element_object(
         let doc = doc.clone();
         let nid = node_id;
         unsafe {
-            NativeFunction::from_closure(move |_, args, ctx| {
+            NativeFunction::from_closure(move |_, args, _ctx| {
                 let cls = args.first()
                     .and_then(|v| v.as_string())
                     .map(|s| s.to_std_string_escaped())

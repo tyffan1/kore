@@ -12,7 +12,7 @@ pub struct SyscallRule {
     pub action: SyscallAction,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Policy {
     pub syscall_rules: Vec<SyscallRule>,
     pub max_memory: Option<u64>,
@@ -21,37 +21,13 @@ pub struct Policy {
     pub allow_filesystem: bool,
 }
 
-impl Default for Policy {
-    fn default() -> Self {
-        Self {
-            syscall_rules: Vec::new(),
-            max_memory: None,
-            max_cpu_time: None,
-            allow_networking: false,
-            allow_filesystem: false,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct PolicyBuilder {
     syscall_rules: Vec<SyscallRule>,
     max_memory: Option<u64>,
     max_cpu_time: Option<u64>,
     allow_networking: bool,
     allow_filesystem: bool,
-}
-
-impl Default for PolicyBuilder {
-    fn default() -> Self {
-        Self {
-            syscall_rules: Vec::new(),
-            max_memory: None,
-            max_cpu_time: None,
-            allow_networking: false,
-            allow_filesystem: false,
-        }
-    }
 }
 
 impl PolicyBuilder {

@@ -13,8 +13,9 @@ use kore_ui::{ModernTheme, WindowControlsStyle};
 use kore_window::{AppEvent, EventLoop, InputEvent, Key, Modifiers, MouseButton, WindowBuilder, WindowHandle};
 
 const SEARCH_ENGINES: &[(&str, &str)] = &[
-    ("Bing", "https://www.bing.com/search?q="),
+    ("Google", "https://www.google.com/search?q="),
     ("DuckDuckGo", "https://html.duckduckgo.com/html/?q="),
+    ("Bing", "https://www.bing.com/search?q="),
 ];
 
 const UI_FONT: &str = "SF Pro Text";
@@ -37,6 +38,166 @@ impl Fetcher for RemoteFetcher {
 
 fn text_draw(x: f32, y: f32, text: String, font_size: f32, color: Color) -> DrawText {
     DrawText { x, y, text, font_size, color, font_family: Some(UI_FONT.to_string()), bold: false, italic: false, opacity: 1.0, translate: (0.0, 0.0) }
+}
+
+/// Which edge/corner of the frameless window the mouse is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResizeEdge {
+    Left,
+    Right,
+    Top,
+    Bottom,
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+/// An in-flight custom window resize drag.
+struct ResizeDrag {
+    edge: ResizeEdge,
+}
+
+/// Width of the invisible resize strip around the window edges.
+const RESIZE_EDGE: f64 = 6.0;
+const MIN_WINDOW_W: f64 = 400.0;
+const MIN_WINDOW_H: f64 = 300.0;
+
+/// Which resize handle (if any) the logical position `(x, y)` falls on,
+/// given the current window size.
+fn resize_edge_at(x: f64, y: f64, w: f64, h: f64) -> Option<ResizeEdge> {
+    if w <= 0.0 || h <= 0.0 {
+        return None;
+    }
+    let left = x < RESIZE_EDGE;
+    let right = x > w - RESIZE_EDGE;
+    let top = y < RESIZE_EDGE;
+    let bottom = y > h - RESIZE_EDGE;
+    match (left, right, top, bottom) {
+        (true, false, true, false) => Some(ResizeEdge::TopLeft),
+        (true, false, false, true) => Some(ResizeEdge::BottomLeft),
+        (false, true, true, false) => Some(ResizeEdge::TopRight),
+        (false, true, false, true) => Some(ResizeEdge::BottomRight),
+        (true, false, false, false) => Some(ResizeEdge::Left),
+        (false, true, false, false) => Some(ResizeEdge::Right),
+        (false, false, true, false) => Some(ResizeEdge::Top),
+        (false, false, false, true) => Some(ResizeEdge::Bottom),
+        _ => None,
+    }
+}
+
+/// Computes the new window geometry while dragging `edge`, keeping the
+/// opposite edge anchored.
+///
+/// All inputs are in physical (screen) units: `mouse` is the cursor
+/// position on screen, `pos` the current window outer position and
+/// `cur` the current window size. Returns the new size and outer
+/// position. The dragged edge always follows the mouse, regardless of
+/// how the platform applies the size change.
+fn resize_geometry(
+    edge: ResizeEdge,
+    mouse_x: f64,
+    mouse_y: f64,
+    pos_x: f64,
+    pos_y: f64,
+    cur_w: f64,
+    cur_h: f64,
+    min_w: f64,
+    min_h: f64,
+) -> (u32, u32, i32, i32) {
+    let right = pos_x + cur_w;
+    let bottom = pos_y + cur_h;
+    let (mut nw, mut nh) = (cur_w, cur_h);
+    match edge {
+        ResizeEdge::Left => nw = right - mouse_x,
+        ResizeEdge::Right => nw = mouse_x - pos_x,
+        ResizeEdge::Top => nh = bottom - mouse_y,
+        ResizeEdge::Bottom => nh = mouse_y - pos_y,
+        ResizeEdge::TopLeft => {
+            nw = right - mouse_x;
+            nh = bottom - mouse_y;
+        }
+        ResizeEdge::TopRight => {
+            nw = mouse_x - pos_x;
+            nh = bottom - mouse_y;
+        }
+        ResizeEdge::BottomLeft => {
+            nw = right - mouse_x;
+            nh = mouse_y - pos_y;
+        }
+        ResizeEdge::BottomRight => {
+            nw = mouse_x - pos_x;
+            nh = mouse_y - pos_y;
+        }
+    }
+    nw = nw.max(min_w);
+    nh = nh.max(min_h);
+    let nx = if matches!(
+        edge,
+        ResizeEdge::Left | ResizeEdge::TopLeft | ResizeEdge::BottomLeft
+    ) {
+        right - nw
+    } else {
+        pos_x
+    };
+    let ny = if matches!(edge, ResizeEdge::Top | ResizeEdge::TopLeft | ResizeEdge::TopRight) {
+        bottom - nh
+    } else {
+        pos_y
+    };
+    (nw as u32, nh as u32, nx as i32, ny as i32)
+}
+
+fn resize_cursor(edge: ResizeEdge) -> winit::window::CursorIcon {
+    match edge {
+        ResizeEdge::Left => winit::window::CursorIcon::WResize,
+        ResizeEdge::Right => winit::window::CursorIcon::EResize,
+        ResizeEdge::Top => winit::window::CursorIcon::NResize,
+        ResizeEdge::Bottom => winit::window::CursorIcon::SResize,
+        ResizeEdge::TopLeft => winit::window::CursorIcon::NwResize,
+        ResizeEdge::TopRight => winit::window::CursorIcon::NeResize,
+        ResizeEdge::BottomLeft => winit::window::CursorIcon::SwResize,
+        ResizeEdge::BottomRight => winit::window::CursorIcon::SeResize,
+    }
+}
+
+fn apply_resize_cursor(state: &mut AppState) {
+    if let Some(ref win) = state.window {
+        let icon = match state.resize_edge {
+            Some(edge) => resize_cursor(edge),
+            None => winit::window::CursorIcon::Default,
+        };
+        win.set_cursor(icon);
+    }
+}
+
+/// Applies the current mouse position to the in-flight resize drag,
+/// anchoring the edge opposite to the one being dragged.
+fn apply_resize(state: &mut AppState) {
+    let Some(ref win) = state.window else { return };
+    let Some(drag) = state.resizing.as_ref() else { return };
+    let cur = win.inner_size();
+    let sf = win.scale_factor();
+    let Ok(pos) = win.outer_position() else {
+        return;
+    };
+    let mouse_x = pos.x as f64 + state.mouse_x * sf;
+    let mouse_y = pos.y as f64 + state.mouse_y * sf;
+    let (nw, nh, nx, ny) = resize_geometry(
+        drag.edge,
+        mouse_x,
+        mouse_y,
+        pos.x as f64,
+        pos.y as f64,
+        cur.width as f64,
+        cur.height as f64,
+        MIN_WINDOW_W * sf,
+        MIN_WINDOW_H * sf,
+    );
+    if nx != pos.x || ny != pos.y {
+        win.set_outer_position(winit::dpi::PhysicalPosition::new(nx, ny));
+    }
+    let _ = win.request_inner_size(winit::dpi::PhysicalSize::new(nw, nh));
 }
 
 struct AppState {
@@ -73,6 +234,8 @@ struct AppState {
     devtools: DevTools,
     focused: bool,
     hovered_tab_index: Option<usize>,
+    resize_edge: Option<ResizeEdge>,
+    resizing: Option<ResizeDrag>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -163,6 +326,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         devtools: DevTools::new(),
         focused: true,
         hovered_tab_index: None,
+        resize_edge: None,
+        resizing: None,
     });
 
     let renderer = RefCell::new(None::<Renderer>);
@@ -273,9 +438,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 eprintln!("GPU render error: {e}");
                             }
                         }
-                        if let Some(ref w) = state.borrow().window {
-                            w.request_redraw();
-                        }
                     }
                 } else if let Some(r) = renderer.borrow_mut().as_mut() {
                     let display_list = &state.borrow().display_list;
@@ -284,9 +446,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             r.submit(&mut frame, display_list);
                             if let Err(e) = pollster::block_on(r.end_frame(frame)) {
                                 eprintln!("Render error: {e}");
-                            }
-                            if let Some(ref w) = state.borrow().window {
-                                w.request_redraw();
                             }
                         }
                         Err(e) => {
@@ -299,6 +458,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             AppEvent::Input(input) => {
                 let mut s = state.borrow_mut();
                 handle_input(&mut s, input);
+                // React to input immediately, but never in a tight loop:
+                // rendering is event-driven, not continuous.
+                if let Some(ref w) = s.window {
+                    w.request_redraw();
+                }
             }
 
             AppEvent::Resized { width, height } => {
@@ -379,11 +543,23 @@ fn handle_input(state: &mut AppState, event: InputEvent) {
         InputEvent::MouseMoved { x, y } => {
             state.mouse_x = x;
             state.mouse_y = y;
-            update_hover_states(state);
+            if state.resizing.is_some() {
+                apply_resize(state);
+            } else {
+                update_hover_states(state);
+            }
         }
 
         InputEvent::MouseClicked { button: MouseButton::Left, .. } => {
             handle_mouse_click(state, state.mouse_x, state.mouse_y);
+        }
+
+        InputEvent::MouseReleased { .. } => {
+            if state.resizing.take().is_some() {
+                if let Some(ref win) = state.window {
+                    win.request_redraw();
+                }
+            }
         }
 
         InputEvent::Scroll { delta_y, .. } => {
@@ -440,7 +616,26 @@ fn update_hover_states(state: &mut AppState) {
     let x = state.mouse_x;
     let y = state.mouse_y;
     let w = state.window_width as f64;
+    let h = state.window_height as f64;
     let style = WindowControlsStyle::current();
+
+    // Resize handles (frameless window): strip along the window edges.
+    let edge = resize_edge_at(x, y, w, h);
+    if edge != state.resize_edge {
+        state.resize_edge = edge;
+        apply_resize_cursor(state);
+    }
+
+    if edge.is_some() {
+        state.back_button_hover = false;
+        state.forward_button_hover = false;
+        state.reload_button_hover = false;
+        state.close_btn_hover = false;
+        state.min_btn_hover = false;
+        state.max_btn_hover = false;
+        state.hovered_tab_index = None;
+        return;
+    }
 
     // Toolbar buttons (y 36..80)
     state.back_button_hover = x >= 8.0 && x <= 36.0 && y >= 36.0 && y <= 80.0;
@@ -506,7 +701,16 @@ fn update_hover_states(state: &mut AppState) {
 
 fn handle_mouse_click(state: &mut AppState, x: f64, y: f64) {
     let w = state.window_width as f64;
+    let h = state.window_height as f64;
     let style = WindowControlsStyle::current();
+
+    // Start a window resize drag when clicking on an edge handle.
+    if state.resizing.is_none() {
+        if let Some(edge) = resize_edge_at(x, y, w, h) {
+            state.resizing = Some(ResizeDrag { edge });
+            return;
+        }
+    }
 
     // ── Row 1: Titlebar + Tab bar (y < 36) ──
     if y < 36.0 {
@@ -1369,4 +1573,119 @@ fn build_display_list(state: &mut AppState) {
         list.push_rect(DrawRect { x: sb_x, y: thumb_y, width: scrollbar_width, height: thumb_height, color: Color::from_rgba8(ModernTheme::TextSecondary.0, ModernTheme::TextSecondary.1, ModernTheme::TextSecondary.2, 150), opacity: 1.0, translate: (0.0, 0.0) });
     }
 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn edge_detection_center_is_none() {
+        assert_eq!(resize_edge_at(200.0, 150.0, 400.0, 300.0), None);
+    }
+
+    #[test]
+    fn edge_detection_four_sides() {
+        assert_eq!(resize_edge_at(2.0, 150.0, 400.0, 300.0), Some(ResizeEdge::Left));
+        assert_eq!(resize_edge_at(398.0, 150.0, 400.0, 300.0), Some(ResizeEdge::Right));
+        assert_eq!(resize_edge_at(200.0, 2.0, 400.0, 300.0), Some(ResizeEdge::Top));
+        assert_eq!(resize_edge_at(200.0, 298.0, 400.0, 300.0), Some(ResizeEdge::Bottom));
+    }
+
+    #[test]
+    fn edge_detection_corners_win() {
+        assert_eq!(resize_edge_at(2.0, 2.0, 400.0, 300.0), Some(ResizeEdge::TopLeft));
+        assert_eq!(resize_edge_at(398.0, 2.0, 400.0, 300.0), Some(ResizeEdge::TopRight));
+        assert_eq!(resize_edge_at(2.0, 298.0, 400.0, 300.0), Some(ResizeEdge::BottomLeft));
+        assert_eq!(resize_edge_at(398.0, 298.0, 400.0, 300.0), Some(ResizeEdge::BottomRight));
+    }
+
+    #[test]
+    fn edge_detection_outside_threshold_is_none() {
+        assert_eq!(resize_edge_at(7.0, 150.0, 400.0, 300.0), None);
+        assert_eq!(resize_edge_at(200.0, 7.0, 400.0, 300.0), None);
+    }
+
+    #[test]
+    fn right_edge_grows_right_keeps_left_anchored() {
+        let (nw, nh, nx, ny) = resize_geometry(
+            ResizeEdge::Right, 950.0, 150.0, 100.0, 100.0, 800.0, 600.0, 400.0, 300.0,
+        );
+        assert_eq!((nw, nh), (850, 600));
+        assert_eq!((nx, ny), (100, 100));
+    }
+
+    #[test]
+    fn right_edge_same_spot_keeps_size() {
+        let (nw, nh, nx, ny) = resize_geometry(
+            ResizeEdge::Right, 900.0, 150.0, 100.0, 100.0, 800.0, 600.0, 400.0, 300.0,
+        );
+        assert_eq!((nw, nh), (800, 600));
+        assert_eq!((nx, ny), (100, 100));
+    }
+
+    #[test]
+    fn left_edge_keeps_right_edge_anchored() {
+        // Window spans x 100..900; dragging the left edge to x=80 widens it
+        // to 820 and moves the window so the right edge stays at 900.
+        let (nw, nh, nx, ny) = resize_geometry(
+            ResizeEdge::Left, 80.0, 150.0, 100.0, 100.0, 800.0, 600.0, 400.0, 300.0,
+        );
+        assert_eq!((nw, nh), (820, 600));
+        assert_eq!((nx, ny), (80, 100));
+        assert_eq!(nx as f64 + nw as f64, 900.0);
+    }
+
+    #[test]
+    fn top_edge_keeps_bottom_anchored() {
+        // Window spans y 100..700; dragging the top edge to y=80 grows the
+        // height to 620 and moves the window down so the bottom stays at 700.
+        let (nw, nh, nx, ny) = resize_geometry(
+            ResizeEdge::Top, 150.0, 80.0, 100.0, 100.0, 800.0, 600.0, 400.0, 300.0,
+        );
+        assert_eq!((nw, nh), (800, 620));
+        assert_eq!((nx, ny), (100, 80));
+        assert_eq!(ny as f64 + nh as f64, 700.0);
+    }
+
+    #[test]
+    fn bottom_right_corner_moves_nothing() {
+        let (nw, nh, nx, ny) = resize_geometry(
+            ResizeEdge::BottomRight, 950.0, 750.0, 100.0, 100.0, 800.0, 600.0, 400.0, 300.0,
+        );
+        assert_eq!((nw, nh), (850, 650));
+        assert_eq!((nx, ny), (100, 100));
+    }
+
+    #[test]
+    fn top_left_corner_anchors_bottom_right() {
+        let (nw, nh, nx, ny) = resize_geometry(
+            ResizeEdge::TopLeft, 80.0, 70.0, 100.0, 100.0, 800.0, 600.0, 400.0, 300.0,
+        );
+        assert_eq!((nw, nh), (820, 630));
+        assert_eq!((nx, ny), (80, 70));
+        assert_eq!(nx as f64 + nw as f64, 900.0);
+        assert_eq!(ny as f64 + nh as f64, 700.0);
+    }
+
+    #[test]
+    fn resize_clamps_to_minimum() {
+        // Dragging far beyond the right edge clamps width to the minimum;
+        // the anchored left edge keeps the position intact.
+        let (nw, nh, nx, ny) = resize_geometry(
+            ResizeEdge::Right, 100.0, 150.0, 100.0, 100.0, 800.0, 600.0, 400.0, 300.0,
+        );
+        assert_eq!((nw, nh), (400, 600));
+        assert_eq!((nx, ny), (100, 100));
+    }
+
+    #[test]
+    fn resize_minimum_respects_min_size_for_left_edge() {
+        let (nw, nh, nx, ny) = resize_geometry(
+            ResizeEdge::Left, 1200.0, 150.0, 100.0, 100.0, 800.0, 600.0, 400.0, 300.0,
+        );
+        assert_eq!((nw, nh), (400, 600));
+        assert_eq!((nx, ny), (500, 100));
+        assert_eq!(nx as f64 + nw as f64, 900.0);
+    }
 }

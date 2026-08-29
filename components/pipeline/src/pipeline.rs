@@ -46,6 +46,7 @@ script { display: none !important; }
 style { display: none !important; }
 link { display: none !important; }
 meta { display: none !important; }
+noscript { display: none !important; }
 title { display: none !important; }
 b { font-weight: bold; }
 strong { font-weight: bold; }
@@ -160,6 +161,20 @@ impl Pipeline {
         current_url: &Url,
     ) -> Result<RenderResult, PipelineError> {
         let document = Arc::new(std::sync::Mutex::new(parse_document(html)?));
+
+        // `<meta http-equiv="refresh" content="0; url=…">` redirects must be
+        // followed before anything else: search engines often serve a
+        // placeholder document with an immediate meta-refresh instead of a
+        // direct answer (e.g. Google's first hit on /search without cookies).
+        if let Some((target, 0)) = document
+            .lock()
+            .ok()
+            .and_then(|d| meta_refresh_target(&d, current_url))
+        {
+            return Ok(RenderResult::Navigated(
+                target.unwrap_or_else(|| current_url.clone()),
+            ));
+        }
 
         let mut js_navigation: Option<String> = None;
 
@@ -557,10 +572,79 @@ pub fn page_title(document: &kore_html::Document) -> Option<String> {
     None
 }
 
+/// Parse `<meta http-equiv="refresh">`, if any, returning the optional target
+/// URL (`None` = reload the current page) and the delay in seconds.
+fn meta_refresh_target(document: &kore_html::Document, base: &Url) -> Option<(Option<Url>, u64)> {
+    for node in document.nodes() {
+        if let NodeKind::Element(el) = &node.kind {
+            if !el.tag_name.eq_ignore_ascii_case("meta") {
+                continue;
+            }
+            let is_refresh = el.attributes.iter().any(|attr| {
+                attr.name.eq_ignore_ascii_case("http-equiv")
+                    && attr.value.eq_ignore_ascii_case("refresh")
+            });
+            if !is_refresh {
+                continue;
+            }
+            let content = el
+                .attributes
+                .iter()
+                .find(|a| a.name.eq_ignore_ascii_case("content"))
+                .map(|a| a.value.as_str())
+                .unwrap_or("");
+            let (delay_str, url_part) = match content.split_once(';') {
+                Some((delay, rest)) => (delay.trim(), rest.trim()),
+                None => (content.trim(), ""),
+            };
+            let delay = delay_str.parse::<u64>().unwrap_or(0);
+            let target = if url_part.is_empty() {
+                None
+            } else {
+                let rest = match url_part.get(..4).map(|p| p.eq_ignore_ascii_case("url=")) {
+                    Some(true) => &url_part[4..],
+                    _ => url_part,
+                };
+                let cleaned = rest.trim_matches(['\'', '"']);
+                base.join(cleaned).ok()
+            };
+            return Some((target, delay));
+        }
+    }
+    None
+}
+
+/// True when `node_id` is a descendant of a `<noscript>` element. JavaScript
+/// is always available in Kore (there is no "disable JS" setting), so
+/// `<noscript>` content is hidden and never processed: no stylesheets, no
+/// scripts, no images, no links — matching a browser with JS enabled.
+fn inside_noscript(document: &kore_html::Document, mut node_id: NodeId) -> bool {
+    let mut depth = 0;
+    while let Some(node) = document.node(node_id) {
+        depth += 1;
+        if depth > 4096 {
+            return false;
+        }
+        if let NodeKind::Element(el) = &node.kind {
+            if el.tag_name.eq_ignore_ascii_case("noscript") {
+                return true;
+            }
+        }
+        match node.parent {
+            Some(parent) => node_id = parent,
+            None => return false,
+        }
+    }
+    false
+}
+
 /// Find `<link rel="stylesheet">` elements and resolve their href to absolute URLs.
 pub fn linked_stylesheets(document: &kore_html::Document, base: &Url) -> Vec<Url> {
     let mut urls = Vec::new();
     for node in document.nodes() {
+        if inside_noscript(document, node.id) {
+            continue;
+        }
         if let NodeKind::Element(el) = &node.kind {
             if el.tag_name.eq_ignore_ascii_case("link") {
                 let is_stylesheet = el.attributes.iter().any(|attr| {
@@ -603,6 +687,10 @@ fn collect_scripts_recursive(
         Some(n) => n,
         None => return,
     };
+
+    if inside_noscript(document, node_id) {
+        return;
+    }
 
     if let NodeKind::Element(el) = &node.kind {
         if el.tag_name.eq_ignore_ascii_case("script") {
@@ -876,6 +964,9 @@ fn image_key(src: &str, base: &Url) -> String {
 fn image_sources(document: &kore_html::Document, base: &Url) -> Vec<(String, Option<Url>)> {
     let mut sources = Vec::new();
     for node in document.nodes() {
+        if inside_noscript(document, node.id) {
+            continue;
+        }
         if let NodeKind::Element(el) = &node.kind {
             if el.tag_name.eq_ignore_ascii_case("img") {
                 if let Some(src) = get_attribute(el, "src") {
@@ -1353,6 +1444,122 @@ mod tests {
             out.push(if chunk.len() > 2 { TABLE[triple as usize & 63] as char } else { '=' });
         }
         out
+    }
+
+    #[test]
+    fn meta_refresh_zero_delay_target_resolved() {
+        let doc = parse_document(
+            r#"<html><head><meta http-equiv="refresh" content="0; url=https://example.com/final"></head><body>x</body></html>"#,
+        )
+        .unwrap();
+        let base = Url::parse("https://www.google.com/search").unwrap();
+        let (target, delay) = meta_refresh_target(&doc, &base).unwrap();
+        assert_eq!(delay, 0);
+        assert_eq!(target.unwrap().as_str(), "https://example.com/final");
+    }
+
+    #[test]
+    fn meta_refresh_relative_url_resolved_against_base() {
+        let doc = parse_document(r#"<meta http-equiv=refresh content="0; url=/search?q=kore">"#).unwrap();
+        let base = Url::parse("https://www.google.com/").unwrap();
+        let (target, _) = meta_refresh_target(&doc, &base).unwrap();
+        assert_eq!(
+            target.unwrap().as_str(),
+            "https://www.google.com/search?q=kore"
+        );
+    }
+
+    #[test]
+    fn meta_refresh_reload_without_url() {
+        let doc = parse_document(r#"<meta http-equiv="refresh" content="0">"#).unwrap();
+        let base = Url::parse("https://example.com/x").unwrap();
+        let (target, delay) = meta_refresh_target(&doc, &base).unwrap();
+        assert_eq!(delay, 0);
+        assert!(target.is_none());
+    }
+
+    #[test]
+    fn meta_refresh_quoted_url_and_delay_parsed() {
+        let doc = parse_document(
+            r#"<meta http-equiv="refresh" content="5; URL='https://example.com/after'">"#,
+        )
+        .unwrap();
+        let base = Url::parse("https://example.com/").unwrap();
+        let (target, delay) = meta_refresh_target(&doc, &base).unwrap();
+        assert_eq!(delay, 5);
+        assert_eq!(target.unwrap().as_str(), "https://example.com/after");
+    }
+
+    #[test]
+    fn meta_refresh_absent_returns_none() {
+        let doc = parse_document(r#"<meta name="viewport" content="width=device-width">"#).unwrap();
+        let base = Url::parse("https://example.com/").unwrap();
+        assert!(meta_refresh_target(&doc, &base).is_none());
+    }
+
+    #[test]
+    fn noscript_images_not_collected() {
+        let doc = parse_document(
+            r#"<html><body><noscript><img src="https://example.com/noscript.png"></noscript><img src="https://example.com/normal.png"></body></html>"#,
+        )
+        .unwrap();
+        let base = Url::parse("https://example.com/").unwrap();
+        let sources = image_sources(&doc, &base);
+        assert_eq!(sources.len(), 1);
+        assert!(sources[0].1.as_ref().unwrap().as_str().ends_with("normal.png"));
+    }
+
+    #[test]
+    fn noscript_stylesheets_not_collected() {
+        let doc = parse_document(
+            r#"<html><head><noscript><link rel="stylesheet" href="https://example.com/noscript.css"></noscript><link rel="stylesheet" href="https://example.com/normal.css"></head><body></body></html>"#,
+        )
+        .unwrap();
+        let base = Url::parse("https://example.com/").unwrap();
+        let css = linked_stylesheets(&doc, &base);
+        assert_eq!(css.len(), 1);
+        assert!(css[0].as_str().ends_with("normal.css"));
+    }
+
+    #[test]
+    fn noscript_scripts_not_collected() {
+        let doc = parse_document(
+            r#"<html><head><noscript><script>window.x = 1;</script></noscript><script>window.y = 2;</script></head><body></body></html>"#,
+        )
+        .unwrap();
+        let entries = collect_script_entries(doc);
+        assert_eq!(entries.len(), 1);
+        match &entries[0] {
+            ScriptEntry::Inline(content) => assert!(content.contains("window.y")),
+            ScriptEntry::External(_) => panic!("expected inline script"),
+        }
+    }
+
+    #[test]
+    fn noscript_subtree_absent_from_layout() {
+        let doc = parse_document(
+            r#"<html><body><noscript><p>Turn on JavaScript to keep searching</p></noscript><p>visible</p></body></html>"#,
+        )
+        .unwrap();
+        let stylesheet = parse_stylesheet(DEFAULT_CSS).unwrap();
+        let layout_tree = layout_document(
+            &doc,
+            &stylesheet,
+            LayoutConfig {
+                viewport_width: 800.0,
+                viewport_height: 600.0,
+            },
+        )
+        .unwrap();
+        let text_present = |needle: &str| {
+            layout_tree.nodes.iter().any(|node| {
+                node.dom_node_id.and_then(|id| doc.node(id)).is_some_and(|n| {
+                    matches!(&n.kind, NodeKind::Text(t) if t.contains(needle))
+                })
+            })
+        };
+        assert!(!text_present("Turn on JavaScript"));
+        assert!(text_present("visible"));
     }
 
     #[test]

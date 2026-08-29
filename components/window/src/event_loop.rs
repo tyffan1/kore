@@ -63,7 +63,10 @@ impl EventLoop {
             winit::event::Event::WindowEvent { event: winit_event, .. } => {
                 Self::map_window_event(winit_event, modifiers)
             }
-            winit::event::Event::AboutToWait => vec![AppEvent::Redraw],
+            // The window is created lazily on the first `Redraw` (the
+            // event loop must be running to call `ActiveEventLoop::create_window`),
+            // so the startup `Resumed` event kicks off the first redraw.
+            winit::event::Event::Resumed => vec![AppEvent::Redraw],
             _ => vec![],
         }
     }
@@ -78,6 +81,7 @@ impl EventLoop {
                 width: size.width,
                 height: size.height,
             }],
+            winit::event::WindowEvent::RedrawRequested => vec![AppEvent::Redraw],
             winit::event::WindowEvent::CloseRequested => vec![AppEvent::CloseRequested],
             winit::event::WindowEvent::Focused(focused) => {
                 vec![AppEvent::FocusChanged(*focused)]
@@ -130,15 +134,7 @@ impl EventLoop {
                 })]
             }
             winit::event::WindowEvent::MouseInput { button, state, .. } => {
-                if *state == winit::event::ElementState::Pressed {
-                    vec![AppEvent::Input(InputEvent::MouseClicked {
-                        button: mouse_button_from_winit(*button),
-                        x: 0.0,
-                        y: 0.0,
-                    })]
-                } else {
-                    vec![]
-                }
+                map_mouse_input(mouse_button_from_winit(*button), *state)
             }
             winit::event::WindowEvent::MouseWheel { delta, .. } => {
                 let (dx, dy) = match delta {
@@ -154,6 +150,18 @@ impl EventLoop {
             }
             _ => vec![],
         }
+    }
+}
+
+fn map_mouse_input(button: MouseButton, state: winit::event::ElementState) -> Vec<AppEvent> {
+    if state == winit::event::ElementState::Pressed {
+        vec![AppEvent::Input(InputEvent::MouseClicked {
+            button,
+            x: 0.0,
+            y: 0.0,
+        })]
+    } else {
+        vec![AppEvent::Input(InputEvent::MouseReleased { button })]
     }
 }
 
@@ -300,14 +308,16 @@ mod tests {
     #[test]
     fn close_requested_maps_correctly() {
         let we = winit::event::WindowEvent::CloseRequested;
-        let mapped = EventLoop::map_window_event(&we, &mut Modifiers::NONE);
+        let mut mods = Modifiers::NONE;
+        let mapped = EventLoop::map_window_event(&we, &mut mods);
         assert!(matches!(mapped[..], [AppEvent::CloseRequested]));
     }
 
     #[test]
     fn resize_maps_correctly() {
         let we = winit::event::WindowEvent::Resized(winit::dpi::PhysicalSize::new(800, 600));
-        let mapped = EventLoop::map_window_event(&we, &mut Modifiers::NONE);
+        let mut mods = Modifiers::NONE;
+        let mapped = EventLoop::map_window_event(&we, &mut mods);
         assert!(matches!(
             mapped[..],
             [AppEvent::Resized {
@@ -320,7 +330,8 @@ mod tests {
     #[test]
     fn focus_changed_maps() {
         let we = winit::event::WindowEvent::Focused(true);
-        let mapped = EventLoop::map_window_event(&we, &mut Modifiers::NONE);
+        let mut mods = Modifiers::NONE;
+        let mapped = EventLoop::map_window_event(&we, &mut mods);
         assert!(matches!(mapped[..], [AppEvent::FocusChanged(true)]));
     }
 
@@ -384,5 +395,23 @@ mod tests {
         assert!(mapped.is_empty());
         assert!(mods.ctrl);
         assert!(!mods.shift);
+    }
+
+    #[test]
+    fn mouse_press_maps_to_clicked() {
+        let mapped = map_mouse_input(MouseButton::Left, winit::event::ElementState::Pressed);
+        assert!(matches!(
+            mapped[..],
+            [AppEvent::Input(InputEvent::MouseClicked { button: MouseButton::Left, .. })]
+        ));
+    }
+
+    #[test]
+    fn mouse_release_maps_to_released() {
+        let mapped = map_mouse_input(MouseButton::Left, winit::event::ElementState::Released);
+        assert!(matches!(
+            mapped[..],
+            [AppEvent::Input(InputEvent::MouseReleased { button: MouseButton::Left })]
+        ));
     }
 }

@@ -49,10 +49,10 @@ mod tests {
     fn spawn_and_kill_does_not_error() {
         let policy = PolicyBuilder::new().allow_filesystem(true).build();
         let args = make_args(&["/C", "echo", "hello"]);
-        if let Ok(mut proc) = SandboxedProcess::spawn("cmd.exe", &args, &policy) {
-            let result = proc.kill();
-            assert!(result.is_ok());
-        }
+        let mut proc = SandboxedProcess::spawn("cmd.exe", &args, &policy)
+            .expect("sandboxed spawn (job object + limits) must succeed");
+        let result = proc.kill();
+        assert!(result.is_ok());
     }
 
     #[test]

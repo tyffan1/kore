@@ -127,9 +127,6 @@ mod tests {
 
     #[test]
     fn renders_with_attributes() {
-        let node = DomNode::new("a")
-            .with_children(vec![])
-            .with_text("click");
         let node = DomNode {
             tag_name: "a".to_string(),
             id: None,

@@ -24,3 +24,6 @@ serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 wgpu = { version = "22", default-features = false, features = ["wgsl", "dx12", "metal", "vulkan-portability"] }
+
+[dev-dependencies]
+naga = { version = "22", default-features = false, features = ["wgsl-in", "hlsl-out"] }

@@ -16,7 +16,9 @@ path = "src/bin/kore_network.rs"
 workspace = true
 
 [dependencies]
+brotli.workspace = true
 bytes.workspace = true
+flate2.workspace = true
 http-body-util.workspace = true
 hyper.workspace = true
 hyper-rustls.workspace = true

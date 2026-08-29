@@ -41,7 +41,7 @@ impl Default for HttpClientConfig {
     fn default() -> Self {
         Self {
             policy: NetworkPolicy {
-                user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Kore/0.1.0".to_string(),
+                user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36".to_string(),
                 ..NetworkPolicy::default()
             },
             connect_timeout: Duration::from_secs(10),
@@ -66,6 +66,10 @@ pub enum HttpError {
     Body(#[from] hyper::Error),
     #[error("response body exceeded configured limit of {limit} bytes")]
     BodyTooLarge { limit: usize },
+    #[error("unsupported Content-Encoding: {0}")]
+    UnsupportedEncoding(String),
+    #[error("failed to decode {encoding} response body: {message}")]
+    Decode { encoding: String, message: String },
     #[error("exceeded maximum number of redirects ({0})")]
     TooManyRedirects(u8),
     #[error("redirect location header is invalid")]
@@ -171,7 +175,10 @@ impl HttpClient {
                 .header(hyper::header::USER_AGENT, self.config.policy.user_agent.as_str())
                 .header(hyper::header::ACCEPT, "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
                 .header(hyper::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9")
-                .header(hyper::header::ACCEPT_ENCODING, "identity")
+                .header(hyper::header::ACCEPT_ENCODING, "gzip, deflate, br")
+                .header("Sec-Ch-Ua", "\"Not_A Brand\";v=\"8\", \"Chromium\";v=\"120\", \"Google Chrome\";v=\"120\"")
+                .header("Sec-Ch-Ua-Mobile", "?0")
+                .header("Sec-Ch-Ua-Platform", "\"Windows\"")
                 .header("Sec-Fetch-Dest", "document")
                 .header("Sec-Fetch-Mode", "navigate")
                 .header("Sec-Fetch-Site", "none")
@@ -272,7 +279,7 @@ impl HttpClient {
         response: hyper::Response<Incoming>,
     ) -> Result<FetchResponse, HttpError> {
         let status = response.status().as_u16();
-        let headers = response
+        let headers: Vec<(String, String)> = response
             .headers()
             .iter()
             .map(|(name, value)| {
@@ -296,12 +303,81 @@ impl HttpClient {
             }
         }
 
+        let encoding = headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-encoding"))
+            .map(|(_, value)| value.to_ascii_lowercase())
+            .unwrap_or_default();
+        let body = decode_body(bytes, &encoding, limit)?;
+        let headers: Vec<(String, String)> = headers
+            .into_iter()
+            .filter(|(name, _)| !name.eq_ignore_ascii_case("content-encoding"))
+            .collect();
+
         Ok(FetchResponse {
             status,
             final_url,
             headers,
-            body: Bytes::from(bytes),
+            body,
         })
+    }
+}
+
+/// Decode a response body according to its `Content-Encoding`. The same
+/// size limit applies to the decompressed data as to the wire bytes.
+fn decode_body(bytes: Vec<u8>, encoding: &str, limit: usize) -> Result<Bytes, HttpError> {
+    if encoding.is_empty() || encoding == "identity" {
+        return Ok(Bytes::from(bytes));
+    }
+    let decoded: Vec<u8> = match encoding {
+        "gzip" | "x-gzip" => {
+            let mut decoder = flate2::read::GzDecoder::new(bytes.as_slice());
+            read_limited(&mut decoder, limit).map_err(|e| HttpError::Decode {
+                encoding: encoding.to_string(),
+                message: e.to_string(),
+            })?
+        }
+        // Servers variously send zlib-wrapped or raw deflate; try both.
+        "deflate" => {
+            let mut zlib = flate2::read::ZlibDecoder::new(bytes.as_slice());
+            match read_limited(&mut zlib, limit) {
+                Ok(out) => out,
+                Err(_) => {
+                    let mut raw = flate2::read::DeflateDecoder::new(bytes.as_slice());
+                    read_limited(&mut raw, limit).map_err(|e| HttpError::Decode {
+                        encoding: encoding.to_string(),
+                        message: e.to_string(),
+                    })?
+                }
+            }
+        }
+        "br" => {
+            let mut decoder = brotli::Decompressor::new(bytes.as_slice(), 4096);
+            read_limited(&mut decoder, limit).map_err(|e| HttpError::Decode {
+                encoding: encoding.to_string(),
+                message: e.to_string(),
+            })?
+        }
+        other => return Err(HttpError::UnsupportedEncoding(other.to_string())),
+    };
+    Ok(Bytes::from(decoded))
+}
+
+fn read_limited<R: std::io::Read>(reader: &mut R, limit: usize) -> std::io::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            return Ok(out);
+        }
+        if out.len().saturating_add(n) > limit {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "decoded body exceeds configured limit",
+            ));
+        }
+        out.extend_from_slice(&buf[..n]);
     }
 }
 
@@ -390,10 +466,13 @@ mod tests {
     }
 
     #[test]
-    fn default_client_uses_privacy_preserving_policy_surface() {
+    fn default_client_uses_chrome_ua_without_identifying_suffix() {
         let client = HttpClient::default();
-        assert!(client.policy().user_agent.contains("Mozilla/5.0"));
-        assert!(client.policy().user_agent.contains("Kore"));
+        let ua = client.policy().user_agent.as_str();
+        assert!(ua.starts_with("Mozilla/5.0"));
+        assert!(ua.contains("Chrome/120.0.0.0"));
+        assert!(ua.ends_with("Safari/537.36"));
+        assert!(!ua.contains("Kore"));
         assert!(client.policy().max_body_bytes > 0);
     }
 
@@ -424,5 +503,50 @@ mod tests {
         req.body = Some(Bytes::from("key=value"));
         assert_eq!(req.method, Method::Post);
         assert!(req.body.is_some());
+    }
+
+    #[test]
+    fn decode_gzip_body() {
+        use std::io::Write;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(b"hello gzip").unwrap();
+        let compressed = encoder.finish().unwrap();
+        let decoded = decode_body(compressed, "gzip", 1_000_000).unwrap();
+        assert_eq!(decoded.as_ref(), b"hello gzip");
+    }
+
+    #[test]
+    fn decode_brotli_body() {
+        let mut compressed = Vec::new();
+        brotli::enc::BrotliCompress(
+            &mut &b"hello brotli"[..],
+            &mut compressed,
+            &brotli::enc::BrotliEncoderParams::default(),
+        )
+        .unwrap();
+        let decoded = decode_body(compressed, "br", 1_000_000).unwrap();
+        assert_eq!(decoded.as_ref(), b"hello brotli");
+    }
+
+    #[test]
+    fn decode_identity_passes_through() {
+        let decoded = decode_body(b"raw bytes".to_vec(), "identity", 1_000_000).unwrap();
+        assert_eq!(decoded.as_ref(), b"raw bytes");
+    }
+
+    #[test]
+    fn decode_unsupported_encoding_errors() {
+        let err = decode_body(b"data".to_vec(), "zstd", 1_000_000).unwrap_err();
+        assert!(matches!(err, HttpError::UnsupportedEncoding(_)));
+    }
+
+    #[test]
+    fn decode_enforces_limit_on_decompressed_data() {
+        use std::io::Write;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(b"hello gzip").unwrap();
+        let compressed = encoder.finish().unwrap();
+        let err = decode_body(compressed, "gzip", 4).unwrap_err();
+        assert!(matches!(err, HttpError::Decode { .. }));
     }
 }

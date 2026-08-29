@@ -56,6 +56,8 @@ pub enum IpcPayload {
         frame_id: u64,
         width: u32,
         height: u32,
+        /// Raw RGBA bytes; see `GpuImage::pixels` for why `serde_bytes`.
+        #[serde(with = "serde_bytes")]
         pixels: Vec<u8>,
     },
     /// The GPU process failed to render a frame.

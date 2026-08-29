@@ -156,3 +156,59 @@ mod display_list_tests {
         assert!(matches!(cmds[3], DisplayCommand::PopClip));
     }
 }
+
+#[cfg(test)]
+mod shader_validation_tests {
+    /// Every WGSL shader shipped with kore-gpu must parse and validate
+    /// with the same naga version wgpu 22 uses.
+    #[test]
+    fn all_shaders_parse_and_validate() {
+        let shaders_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/shaders");
+        let Ok(entries) = std::fs::read_dir(&shaders_dir) else {
+            assert!(false, "shaders dir must exist: {}", shaders_dir.display());
+            return;
+        };
+        let mut validated = 0;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().map_or(false, |e| e == "wgsl") {
+                let Ok(source) = std::fs::read_to_string(&path) else {
+                    assert!(false, "read shader source: {}", path.display());
+                    return;
+                };
+                let module = match naga::front::wgsl::parse_str(&source) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        assert!(false, "{}: WGSL parse failed: {e}", path.display());
+                        return;
+                    }
+                };
+                let mut validator = naga::valid::Validator::new(
+                    naga::valid::ValidationFlags::all(),
+                    naga::valid::Capabilities::all(),
+                );
+                let info = match validator.validate(&module) {
+                    Ok(i) => i,
+                    Err(e) => {
+                        assert!(false, "{}: WGSL validation failed: {e}", path.display());
+                        return;
+                    }
+                };
+                // Backend codegen can reject constructs the generic validator
+                // accepts (e.g. dynamic indexing of const arrays on DX12).
+                let mut output = String::new();
+                let options = naga::back::hlsl::Options::default();
+                let mut writer = naga::back::hlsl::Writer::new(&mut output, &options);
+                match writer.write(&module, &info, None) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        assert!(false, "{}: HLSL codegen failed: {e}", path.display());
+                        return;
+                    }
+                }
+                validated += 1;
+            }
+        }
+        assert!(validated >= 5, "expected at least 5 shaders, validated {validated}");
+    }
+}

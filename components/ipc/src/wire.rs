@@ -110,6 +110,10 @@ pub struct DrawText {
 pub struct GpuImage {
     pub width: u32,
     pub height: u32,
+    /// Raw RGBA bytes; `serde_bytes` keeps the wire format a plain byte
+    /// blob instead of an element-by-element `Vec<u8>` sequence, which
+    /// bincode would otherwise serialize byte by byte.
+    #[serde(with = "serde_bytes")]
     pub pixels: Vec<u8>,
 }
 
