@@ -56,6 +56,10 @@ enum ResizeEdge {
 /// An in-flight custom window resize drag.
 struct ResizeDrag {
     edge: ResizeEdge,
+    start_pos_x: f64,
+    start_pos_y: f64,
+    start_w: f64,
+    start_h: f64,
 }
 
 /// Width of the invisible resize strip around the window edges.
@@ -176,28 +180,34 @@ fn apply_resize_cursor(state: &mut AppState) {
 fn apply_resize(state: &mut AppState) {
     let Some(ref win) = state.window else { return };
     let Some(drag) = state.resizing.as_ref() else { return };
-    let cur = win.inner_size();
     let sf = win.scale_factor();
     let Ok(pos) = win.outer_position() else {
         return;
     };
-    let mouse_x = pos.x as f64 + state.mouse_x * sf;
-    let mouse_y = pos.y as f64 + state.mouse_y * sf;
+    // CursorMoved gives physical pixels relative to window; add outer pos to get screen.
+    let mouse_x = pos.x as f64 + state.mouse_x;
+    let mouse_y = pos.y as f64 + state.mouse_y;
     let (nw, nh, nx, ny) = resize_geometry(
         drag.edge,
         mouse_x,
         mouse_y,
-        pos.x as f64,
-        pos.y as f64,
-        cur.width as f64,
-        cur.height as f64,
+        drag.start_pos_x,
+        drag.start_pos_y,
+        drag.start_w,
+        drag.start_h,
         MIN_WINDOW_W * sf,
         MIN_WINDOW_H * sf,
     );
-    if nx != pos.x || ny != pos.y {
+    let pos_x = pos.x;
+    let pos_y = pos.y;
+    // Avoid redundant requests that cause stutter.
+    let cur = win.inner_size();
+    if (nw as u32) != cur.width || (nh as u32) != cur.height {
+        let _ = win.request_inner_size(winit::dpi::PhysicalSize::new(nw, nh));
+    }
+    if nx != pos_x || ny != pos_y {
         win.set_outer_position(winit::dpi::PhysicalPosition::new(nx, ny));
     }
-    let _ = win.request_inner_size(winit::dpi::PhysicalSize::new(nw, nh));
 }
 
 struct AppState {
@@ -719,10 +729,28 @@ fn handle_mouse_click(state: &mut AppState, x: f64, y: f64) {
     let h = state.window_height as f64;
     let style = WindowControlsStyle::current();
 
-    // Start a window resize drag when clicking on an edge handle.
-    if state.resizing.is_none() {
-        if let Some(edge) = resize_edge_at(x, y, w, h) {
-            state.resizing = Some(ResizeDrag { edge });
+    // Manual resize — OS drag_resize_window is jittery on frameless (bottom jumps on North drag).
+    if let Some(edge) = resize_edge_at(x, y, w, h) {
+        if state.resizing.is_none() {
+            if let Some(win) = state.window.as_ref() {
+                let pos = win.outer_position().unwrap_or(winit::dpi::PhysicalPosition::new(0, 0));
+                let cur = win.inner_size();
+                state.resizing = Some(ResizeDrag {
+                    edge,
+                    start_pos_x: pos.x as f64,
+                    start_pos_y: pos.y as f64,
+                    start_w: cur.width as f64,
+                    start_h: cur.height as f64,
+                });
+            } else {
+                state.resizing = Some(ResizeDrag {
+                    edge,
+                    start_pos_x: 0.0,
+                    start_pos_y: 0.0,
+                    start_w: w,
+                    start_h: h,
+                });
+            }
             return;
         }
     }
@@ -1586,12 +1614,14 @@ fn draw_devtools_panel(list: &mut DisplayList, devtools: &DevTools, x: f32, y: f
 }
 
 fn build_display_list(state: &mut AppState) {
-    // Sync shared sinks into the owned DevTools snapshot for rendering.
-    if let Ok(c) = state.devtools_console.lock() {
-        state.devtools.console = c.clone();
-    }
-    if let Ok(n) = state.devtools_network.lock() {
-        state.devtools.network = n.clone();
+    // Only pay the clone/lock cost when the panel is actually visible.
+    if state.devtools.is_visible() {
+        if let Ok(c) = state.devtools_console.try_lock() {
+            state.devtools.console = c.clone();
+        }
+        if let Ok(n) = state.devtools_network.try_lock() {
+            state.devtools.network = n.clone();
+        }
     }
     let width = state.window_width;
     let height = state.window_height;

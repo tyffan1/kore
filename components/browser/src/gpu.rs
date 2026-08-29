@@ -68,7 +68,6 @@ impl GpuProcess {
         PolicyBuilder::new()
             .allow_filesystem(true)
             .allow_networking(false)
-            .max_memory(512 * 1024 * 1024)
             .max_cpu_time(30000)
             .build()
     }
