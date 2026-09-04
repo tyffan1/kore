@@ -230,11 +230,12 @@ impl Pipeline {
                 });
                 cb
             });
-        if let Ok(js_runtime) = kore_js::JsRuntime::with_shared_storage_and_console(
+        if let Ok(js_runtime) = kore_js::JsRuntime::with_shared_storage_and_console_and_url(
             document.clone(),
             self.storage.clone(),
             self.cookies.clone(),
             console_sink,
+            Some(current_url.clone()),
         ) {
             let entries = collect_script_entries({
                 let d = document.lock().unwrap();

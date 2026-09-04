@@ -56,6 +56,7 @@ pub struct JsRuntime {
     pub storage: SharedStorage,
     pub cookies: SharedCookieJar,
     console_sink: Option<Arc<dyn Fn(String) + Send + Sync>>,
+    current_url: Option<url::Url>,
 }
 
 impl JsRuntime {
@@ -83,6 +84,16 @@ impl JsRuntime {
         cookies: SharedCookieJar,
         console_sink: Option<Arc<dyn Fn(String) + Send + Sync>>,
     ) -> Result<Self, JsError> {
+        Self::with_shared_storage_and_console_and_url(document, storage, cookies, console_sink, None)
+    }
+
+    pub fn with_shared_storage_and_console_and_url(
+        document: Arc<Mutex<Document>>,
+        storage: SharedStorage,
+        cookies: SharedCookieJar,
+        console_sink: Option<Arc<dyn Fn(String) + Send + Sync>>,
+        current_url: Option<url::Url>,
+    ) -> Result<Self, JsError> {
         let context = Context::default();
         let rt = Self {
             context: RefCell::new(context),
@@ -95,6 +106,7 @@ impl JsRuntime {
             storage,
             cookies,
             console_sink,
+            current_url,
         };
         rt.init_bindings()?;
         Ok(rt)
@@ -275,16 +287,51 @@ var console = {
             .map_err(|e| JsError::Context(e.to_string()))?;
 
         let loc_key = JsString::from("location");
-        if let Ok(loc) = window_obj.get(loc_key, &mut ctx) {
+        if let Ok(loc) = window_obj.get(loc_key.clone(), &mut ctx) {
             if let Some(loc_obj) = loc.as_object() {
+                let reload_nav_sink = self.pending_navigation.clone();
+                let reload_url = self.current_url.clone();
                 let reload_fn = FunctionObjectBuilder::new(
                     ctx.realm(),
-                    NativeFunction::from_fn_ptr(|_, _, _| Ok(BoaValue::Undefined)),
+                    unsafe {
+                        NativeFunction::from_closure(move |_, _, _| {
+                            if let Some(url) = reload_url.as_ref() {
+                                *reload_nav_sink.lock().unwrap() = Some(url.as_str().to_string());
+                            }
+                            Ok(BoaValue::Undefined)
+                        })
+                    },
                 )
                 .name("reload")
                 .build();
                 loc_obj.set(JsString::from("reload"), reload_fn, false, &mut ctx).ok();
             }
+            // `document.location` is a separate object — give it the same reload behavior.
+            if let Ok(doc_loc) = document_obj.get(JsString::from("location"), &mut ctx) {
+                if let Some(doc_loc_obj) = doc_loc.as_object() {
+                    let reload_nav_sink2 = self.pending_navigation.clone();
+                    let reload_url2 = self.current_url.clone();
+                    let reload_fn2 = FunctionObjectBuilder::new(
+                        ctx.realm(),
+                        unsafe {
+                            NativeFunction::from_closure(move |_, _, _| {
+                                if let Some(url) = reload_url2.as_ref() {
+                                    *reload_nav_sink2.lock().unwrap() = Some(url.as_str().to_string());
+                                }
+                                Ok(BoaValue::Undefined)
+                            })
+                        },
+                    )
+                    .name("reload")
+                    .build();
+                    doc_loc_obj
+                        .set(JsString::from("reload"), reload_fn2, false, &mut ctx)
+                        .ok();
+                }
+            }
+            // Expose `location` as global alias (`location.reload()` === `window.location.reload()`).
+            ctx.register_global_property(JsString::from("location"), loc.clone(), Attribute::all())
+                .ok();
         }
 
         let fetch_sync = NativeFunction::from_fn_ptr(|_, args, ctx| {
@@ -2544,6 +2591,36 @@ mod tests {
         rt.eval("__window_location_set_href('https://test.dev/path')")?;
         let nav = rt.pending_navigation.lock().unwrap().take();
         assert_eq!(nav, Some("https://test.dev/path".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn location_reload_sets_pending_navigation_to_current_url() -> Result<(), JsError> {
+        let doc = make_doc();
+        let url = url::Url::parse("https://example.com/page?q=1").unwrap();
+        let storage = Arc::new(Mutex::new(WebStorage::default()));
+        let cookies = Arc::new(Mutex::new(CookieJar::default()));
+        let rt = JsRuntime::with_shared_storage_and_console_and_url(
+            doc, storage, cookies, None, Some(url),
+        )?;
+        rt.eval("location.reload()")?;
+        let nav = rt.pending_navigation.lock().unwrap().take();
+        assert_eq!(nav, Some("https://example.com/page?q=1".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn window_location_reload_sets_pending_navigation() -> Result<(), JsError> {
+        let doc = make_doc();
+        let url = url::Url::parse("https://example.com/").unwrap();
+        let storage = Arc::new(Mutex::new(WebStorage::default()));
+        let cookies = Arc::new(Mutex::new(CookieJar::default()));
+        let rt = JsRuntime::with_shared_storage_and_console_and_url(
+            doc, storage, cookies, None, Some(url),
+        )?;
+        rt.eval("window.location.reload()")?;
+        let nav = rt.pending_navigation.lock().unwrap().take();
+        assert_eq!(nav, Some("https://example.com/".to_string()));
         Ok(())
     }
 
